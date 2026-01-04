@@ -99,7 +99,7 @@ cat > "$ENT_TMP_BASE" <<'PLIST'
 </plist>
 PLIST
 
-cat > "$ENT_TMP_APP_BASE" <<'PLIST'
+cat > "$ENT_TMP_APP_BASE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -108,6 +108,7 @@ cat > "$ENT_TMP_APP_BASE" <<'PLIST'
     <true/>
     <key>com.apple.security.device.audio-input</key>
     <true/>
+$(if [[ "$IDENTITY" == "-" ]]; then echo "    <key>com.apple.security.cs.disable-library-validation</key>"; echo "    <true/>"; fi)
 </dict>
 </plist>
 PLIST
@@ -183,15 +184,29 @@ fi
 # Sign Sparkle deeply if present
 SPARKLE="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 if [ -d "$SPARKLE" ]; then
-  echo "Signing Sparkle framework and helpers"
-  sign_plain_item "$SPARKLE/Versions/B/Sparkle"
-  sign_plain_item "$SPARKLE/Versions/B/Autoupdate"
+  echo "Stripping original Sparkle signatures (required for ad-hoc signing)"
+  # Strip from outermost to innermost
+  codesign --remove-signature "$SPARKLE" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/XPCServices/Installer.xpc" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/Updater.app" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/Autoupdate" 2>/dev/null || true
+  codesign --remove-signature "$SPARKLE/Versions/B/Sparkle" 2>/dev/null || true
+
+  echo "Signing Sparkle framework and helpers (inside-out)"
+  # Sign from innermost to outermost
   sign_plain_item "$SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater"
-  sign_plain_item "$SPARKLE/Versions/B/Updater.app"
   sign_plain_item "$SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
-  sign_plain_item "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
   sign_plain_item "$SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+  sign_plain_item "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
   sign_plain_item "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+  sign_plain_item "$SPARKLE/Versions/B/Updater.app"
+  sign_plain_item "$SPARKLE/Versions/B/Autoupdate"
+  sign_plain_item "$SPARKLE/Versions/B/Sparkle"
   sign_plain_item "$SPARKLE/Versions/B"
   sign_plain_item "$SPARKLE"
 fi

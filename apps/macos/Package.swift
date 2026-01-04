@@ -52,9 +52,6 @@ let package = Package(
             resources: [
                 .copy("Resources/Clawdis.icns"),
                 .copy("Resources/DeviceModels"),
-            ],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency"),
             ]),
         .testTarget(
             name: "ClawdisIPCTests",

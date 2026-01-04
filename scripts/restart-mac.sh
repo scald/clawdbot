@@ -19,8 +19,8 @@ LOG_PATH="${CLAWDIS_RESTART_LOG:-/tmp/clawdis-restart.log}"
 log()  { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Ensure local node binaries (rolldown, tsc, pnpm) are discoverable for the steps below.
-export PATH="${ROOT_DIR}/node_modules/.bin:${PATH}"
+# Ensure local node binaries (rolldown, tsc, pnpm) and bun are discoverable for the steps below.
+export PATH="${ROOT_DIR}/node_modules/.bin:${HOME}/.bun/bin:${PATH}"
 
 run_step() {
   local label="$1"; shift

@@ -126,15 +126,23 @@ PLIST
 echo "🚚 Copying binary"
 cp "$BIN" "$APP_ROOT/Contents/MacOS/Clawdis"
 chmod +x "$APP_ROOT/Contents/MacOS/Clawdis"
-# SwiftPM outputs ad-hoc signed binaries; strip the signature before install_name_tool to avoid warnings.
-/usr/bin/codesign --remove-signature "$APP_ROOT/Contents/MacOS/Clawdis" 2>/dev/null || true
 
 SPARKLE_FRAMEWORK="$BUILD_PATH/$BUILD_CONFIG/Sparkle.framework"
 if [ -d "$SPARKLE_FRAMEWORK" ]; then
   echo "✨ Embedding Sparkle.framework"
   cp -R "$SPARKLE_FRAMEWORK" "$APP_ROOT/Contents/Frameworks/"
   chmod -R a+rX "$APP_ROOT/Contents/Frameworks/Sparkle.framework"
-  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_ROOT/Contents/MacOS/Clawdis"
+  # Add rpath before stripping signature (Swift 6.2.0 binaries require this order)
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_ROOT/Contents/MacOS/Clawdis" 2>/dev/null || true
+  # SwiftPM outputs ad-hoc signed binaries; strip the signature after install_name_tool
+  /usr/bin/codesign --remove-signature "$APP_ROOT/Contents/MacOS/Clawdis" 2>/dev/null || true
+fi
+
+# Copy Swift 6.2 CompatibilitySpan library if available (required by swift-subprocess)
+SWIFT_SPAN_LIB="/Library/Developer/CommandLineTools/usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib"
+if [ -f "$SWIFT_SPAN_LIB" ]; then
+  echo "📚 Copying Swift CompatibilitySpan library"
+  cp "$SWIFT_SPAN_LIB" "$APP_ROOT/Contents/Frameworks/"
 fi
 
 echo "🖼  Copying app icon"
