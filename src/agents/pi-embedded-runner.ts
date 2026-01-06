@@ -24,15 +24,27 @@ import {
 } from "../process/command-queue.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveClawdbotAgentDir } from "./agent-paths.js";
+import {
+  markAuthProfileCooldown,
+  markAuthProfileGood,
+  markAuthProfileUsed,
+} from "./auth-profiles.js";
 import type { BashElevatedDefaults } from "./bash-tools.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
-import { getApiKeyForModel } from "./model-auth.js";
+import {
+  ensureAuthProfileStore,
+  getApiKeyForModel,
+  resolveAuthProfileOrder,
+} from "./model-auth.js";
 import { ensureClawdbotModelsJson } from "./models-config.js";
 import {
   buildBootstrapContextFiles,
   ensureSessionHeader,
   formatAssistantErrorText,
+  isAuthAssistantError,
+  isAuthErrorMessage,
   isRateLimitAssistantError,
+  isRateLimitErrorMessage,
   pickFallbackThinkingLevel,
   sanitizeSessionMessagesImages,
 } from "./pi-embedded-helpers.js";
@@ -74,6 +86,12 @@ export type EmbeddedPiRunMeta = {
   aborted?: boolean;
 };
 
+type ApiKeyInfo = {
+  apiKey: string;
+  profileId?: string;
+  source: string;
+};
+
 export type EmbeddedPiRunResult = {
   payloads?: Array<{
     text?: string;
@@ -84,9 +102,22 @@ export type EmbeddedPiRunResult = {
   meta: EmbeddedPiRunMeta;
 };
 
+export type EmbeddedPiCompactResult = {
+  ok: boolean;
+  compacted: boolean;
+  reason?: string;
+  result?: {
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    details?: unknown;
+  };
+};
+
 type EmbeddedPiQueueHandle = {
   queueMessage: (text: string) => Promise<void>;
   isStreaming: () => boolean;
+  isCompacting: () => boolean;
   abort: () => void;
 };
 
@@ -186,6 +217,7 @@ export function queueEmbeddedPiMessage(
   const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
   if (!handle) return false;
   if (!handle.isStreaming()) return false;
+  if (handle.isCompacting()) return false;
   void handle.queueMessage(text);
   return true;
 }
@@ -300,6 +332,215 @@ function resolvePromptSkills(
     .filter((skill): skill is Skill => Boolean(skill));
 }
 
+export async function compactEmbeddedPiSession(params: {
+  sessionId: string;
+  sessionKey?: string;
+  surface?: string;
+  sessionFile: string;
+  workspaceDir: string;
+  config?: ClawdbotConfig;
+  skillsSnapshot?: SkillSnapshot;
+  provider?: string;
+  model?: string;
+  thinkLevel?: ThinkLevel;
+  bashElevated?: BashElevatedDefaults;
+  customInstructions?: string;
+  lane?: string;
+  enqueue?: typeof enqueueCommand;
+  extraSystemPrompt?: string;
+  ownerNumbers?: string[];
+}): Promise<EmbeddedPiCompactResult> {
+  const sessionLane = resolveSessionLane(
+    params.sessionKey?.trim() || params.sessionId,
+  );
+  const globalLane = resolveGlobalLane(params.lane);
+  const enqueueGlobal =
+    params.enqueue ??
+    ((task, opts) => enqueueCommandInLane(globalLane, task, opts));
+  return enqueueCommandInLane(sessionLane, () =>
+    enqueueGlobal(async () => {
+      const resolvedWorkspace = resolveUserPath(params.workspaceDir);
+      const prevCwd = process.cwd();
+
+      const provider =
+        (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+      const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+      await ensureClawdbotModelsJson(params.config);
+      const agentDir = resolveClawdbotAgentDir();
+      const { model, error, authStorage, modelRegistry } = resolveModel(
+        provider,
+        modelId,
+        agentDir,
+      );
+      if (!model) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: error ?? `Unknown model: ${provider}/${modelId}`,
+        };
+      }
+      try {
+        const apiKeyInfo = await getApiKeyForModel({
+          model,
+          cfg: params.config,
+        });
+        authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+      } catch (err) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: describeUnknownError(err),
+        };
+      }
+
+      await fs.mkdir(resolvedWorkspace, { recursive: true });
+      await ensureSessionHeader({
+        sessionFile: params.sessionFile,
+        sessionId: params.sessionId,
+        cwd: resolvedWorkspace,
+      });
+
+      let restoreSkillEnv: (() => void) | undefined;
+      process.chdir(resolvedWorkspace);
+      try {
+        const shouldLoadSkillEntries =
+          !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
+        const skillEntries = shouldLoadSkillEntries
+          ? loadWorkspaceSkillEntries(resolvedWorkspace)
+          : [];
+        const skillsSnapshot =
+          params.skillsSnapshot ??
+          buildWorkspaceSkillSnapshot(resolvedWorkspace, {
+            config: params.config,
+            entries: skillEntries,
+          });
+        const sandboxSessionKey = params.sessionKey?.trim() || params.sessionId;
+        const sandbox = await resolveSandboxContext({
+          config: params.config,
+          sessionKey: sandboxSessionKey,
+          workspaceDir: resolvedWorkspace,
+        });
+        restoreSkillEnv = params.skillsSnapshot
+          ? applySkillEnvOverridesFromSnapshot({
+              snapshot: params.skillsSnapshot,
+              config: params.config,
+            })
+          : applySkillEnvOverrides({
+              skills: skillEntries ?? [],
+              config: params.config,
+            });
+
+        const bootstrapFiles =
+          await loadWorkspaceBootstrapFiles(resolvedWorkspace);
+        const contextFiles = buildBootstrapContextFiles(bootstrapFiles);
+        const promptSkills = resolvePromptSkills(skillsSnapshot, skillEntries);
+        const tools = createClawdbotCodingTools({
+          bash: {
+            ...params.config?.agent?.bash,
+            elevated: params.bashElevated,
+          },
+          sandbox,
+          surface: params.surface,
+          sessionKey: params.sessionKey ?? params.sessionId,
+          config: params.config,
+        });
+        const machineName = await getMachineDisplayName();
+        const runtimeInfo = {
+          host: machineName,
+          os: `${os.type()} ${os.release()}`,
+          arch: os.arch(),
+          node: process.version,
+          model: `${provider}/${modelId}`,
+        };
+        const sandboxInfo = buildEmbeddedSandboxInfo(sandbox);
+        const reasoningTagHint = provider === "ollama";
+        const userTimezone = resolveUserTimezone(
+          params.config?.agent?.userTimezone,
+        );
+        const userTime = formatUserTime(new Date(), userTimezone);
+        const systemPrompt = buildSystemPrompt({
+          appendPrompt: buildAgentSystemPromptAppend({
+            workspaceDir: resolvedWorkspace,
+            defaultThinkLevel: params.thinkLevel,
+            extraSystemPrompt: params.extraSystemPrompt,
+            ownerNumbers: params.ownerNumbers,
+            reasoningTagHint,
+            runtimeInfo,
+            sandboxInfo,
+            toolNames: tools.map((tool) => tool.name),
+            userTimezone,
+            userTime,
+          }),
+          contextFiles,
+          skills: promptSkills,
+          cwd: resolvedWorkspace,
+          tools,
+        });
+
+        const sessionManager = SessionManager.open(params.sessionFile);
+        const settingsManager = SettingsManager.create(
+          resolvedWorkspace,
+          agentDir,
+        );
+
+        const builtInToolNames = new Set(["read", "bash", "edit", "write"]);
+        const builtInTools = tools.filter((t) => builtInToolNames.has(t.name));
+        const customTools = toToolDefinitions(
+          tools.filter((t) => !builtInToolNames.has(t.name)),
+        );
+
+        const { session } = await createAgentSession({
+          cwd: resolvedWorkspace,
+          agentDir,
+          authStorage,
+          modelRegistry,
+          model,
+          thinkingLevel: mapThinkingLevel(params.thinkLevel),
+          systemPrompt,
+          tools: builtInTools,
+          customTools,
+          sessionManager,
+          settingsManager,
+          skills: promptSkills,
+          contextFiles,
+        });
+
+        try {
+          const prior = await sanitizeSessionMessagesImages(
+            session.messages,
+            "session:history",
+          );
+          if (prior.length > 0) {
+            session.agent.replaceMessages(prior);
+          }
+          const result = await session.compact(params.customInstructions);
+          return {
+            ok: true,
+            compacted: true,
+            result: {
+              summary: result.summary,
+              firstKeptEntryId: result.firstKeptEntryId,
+              tokensBefore: result.tokensBefore,
+              details: result.details,
+            },
+          };
+        } finally {
+          session.dispose();
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: describeUnknownError(err),
+        };
+      } finally {
+        restoreSkillEnv?.();
+        process.chdir(prevCwd);
+      }
+    }),
+  );
+}
+
 export async function runEmbeddedPiAgent(params: {
   sessionId: string;
   sessionKey?: string;
@@ -311,6 +552,7 @@ export async function runEmbeddedPiAgent(params: {
   prompt: string;
   provider?: string;
   model?: string;
+  authProfileId?: string;
   thinkLevel?: ThinkLevel;
   verboseLevel?: VerboseLevel;
   bashElevated?: BashElevatedDefaults;
@@ -368,11 +610,68 @@ export async function runEmbeddedPiAgent(params: {
       if (!model) {
         throw new Error(error ?? `Unknown model: ${provider}/${modelId}`);
       }
-      const apiKey = await getApiKeyForModel(model, authStorage);
-      authStorage.setRuntimeApiKey(model.provider, apiKey);
-
-      let thinkLevel = params.thinkLevel ?? "off";
+      const authStore = ensureAuthProfileStore();
+      const explicitProfileId = params.authProfileId?.trim();
+      const profileOrder = resolveAuthProfileOrder({
+        cfg: params.config,
+        store: authStore,
+        provider,
+        preferredProfile: explicitProfileId,
+      });
+      if (explicitProfileId && !profileOrder.includes(explicitProfileId)) {
+        throw new Error(
+          `Auth profile "${explicitProfileId}" is not configured for ${provider}.`,
+        );
+      }
+      const profileCandidates =
+        profileOrder.length > 0 ? profileOrder : [undefined];
+      let profileIndex = 0;
+      const initialThinkLevel = params.thinkLevel ?? "off";
+      let thinkLevel = initialThinkLevel;
       const attemptedThinking = new Set<ThinkLevel>();
+      let apiKeyInfo: ApiKeyInfo | null = null;
+      let lastProfileId: string | undefined;
+
+      const resolveApiKeyForCandidate = async (candidate?: string) => {
+        return getApiKeyForModel({
+          model,
+          cfg: params.config,
+          profileId: candidate,
+          store: authStore,
+        });
+      };
+
+      const applyApiKeyInfo = async (candidate?: string): Promise<void> => {
+        apiKeyInfo = await resolveApiKeyForCandidate(candidate);
+        authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+        lastProfileId = apiKeyInfo.profileId;
+      };
+
+      const advanceAuthProfile = async (): Promise<boolean> => {
+        let nextIndex = profileIndex + 1;
+        while (nextIndex < profileCandidates.length) {
+          const candidate = profileCandidates[nextIndex];
+          try {
+            await applyApiKeyInfo(candidate);
+            profileIndex = nextIndex;
+            thinkLevel = initialThinkLevel;
+            attemptedThinking.clear();
+            return true;
+          } catch (err) {
+            if (candidate && candidate === explicitProfileId) throw err;
+            nextIndex += 1;
+          }
+        }
+        return false;
+      };
+
+      try {
+        await applyApiKeyInfo(profileCandidates[profileIndex]);
+      } catch (err) {
+        if (profileCandidates[profileIndex] === explicitProfileId) throw err;
+        const advanced = await advanceAuthProfile();
+        if (!advanced) throw err;
+      }
 
       while (true) {
         const thinkingLevel = mapThinkingLevel(thinkLevel);
@@ -513,25 +812,13 @@ export async function runEmbeddedPiAgent(params: {
             session.agent.replaceMessages(prior);
           }
           let aborted = Boolean(params.abortSignal?.aborted);
-          const abortRun = () => {
+          let timedOut = false;
+          const abortRun = (isTimeout = false) => {
             aborted = true;
+            if (isTimeout) timedOut = true;
             void session.abort();
           };
-          const queueHandle: EmbeddedPiQueueHandle = {
-            queueMessage: async (text: string) => {
-              await session.steer(text);
-            },
-            isStreaming: () => session.isStreaming,
-            abort: abortRun,
-          };
-          ACTIVE_EMBEDDED_RUNS.set(params.sessionId, queueHandle);
-
-          const {
-            assistantTexts,
-            toolMetas,
-            unsubscribe,
-            waitForCompactionRetry,
-          } = subscribeEmbeddedPiSession({
+          const subscription = subscribeEmbeddedPiSession({
             session,
             runId: params.runId,
             verboseLevel: params.verboseLevel,
@@ -544,6 +831,22 @@ export async function runEmbeddedPiAgent(params: {
             onAgentEvent: params.onAgentEvent,
             enforceFinalTag: params.enforceFinalTag,
           });
+          const {
+            assistantTexts,
+            toolMetas,
+            unsubscribe,
+            waitForCompactionRetry,
+          } = subscription;
+
+          const queueHandle: EmbeddedPiQueueHandle = {
+            queueMessage: async (text: string) => {
+              await session.steer(text);
+            },
+            isStreaming: () => session.isStreaming,
+            isCompacting: () => subscription.isCompacting(),
+            abort: abortRun,
+          };
+          ACTIVE_EMBEDDED_RUNS.set(params.sessionId, queueHandle);
 
           let abortWarnTimer: NodeJS.Timeout | undefined;
           const abortTimer = setTimeout(
@@ -551,7 +854,7 @@ export async function runEmbeddedPiAgent(params: {
               log.warn(
                 `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
               );
-              abortRun();
+              abortRun(true);
               if (!abortWarnTimer) {
                 abortWarnTimer = setTimeout(() => {
                   if (!session.isStreaming) return;
@@ -611,8 +914,16 @@ export async function runEmbeddedPiAgent(params: {
             params.abortSignal?.removeEventListener?.("abort", onAbort);
           }
           if (promptError && !aborted) {
+            const errorText = describeUnknownError(promptError);
+            if (
+              (isAuthErrorMessage(errorText) ||
+                isRateLimitErrorMessage(errorText)) &&
+              (await advanceAuthProfile())
+            ) {
+              continue;
+            }
             const fallbackThinking = pickFallbackThinkingLevel({
-              message: describeUnknownError(promptError),
+              message: errorText,
               attempted: attemptedThinking,
             });
             if (fallbackThinking) {
@@ -645,13 +956,44 @@ export async function runEmbeddedPiAgent(params: {
           }
 
           const fallbackConfigured =
-            (params.config?.agent?.modelFallbacks?.length ?? 0) > 0;
-          if (fallbackConfigured && isRateLimitAssistantError(lastAssistant)) {
-            const message =
-              lastAssistant?.errorMessage?.trim() ||
-              (lastAssistant ? formatAssistantErrorText(lastAssistant) : "") ||
-              "LLM request rate limited.";
-            throw new Error(message);
+            (params.config?.agent?.model?.fallbacks?.length ?? 0) > 0;
+          const authFailure = isAuthAssistantError(lastAssistant);
+          const rateLimitFailure = isRateLimitAssistantError(lastAssistant);
+
+          // Treat timeout as potential rate limit (Antigravity hangs on rate limit)
+          const shouldRotate =
+            (!aborted && (authFailure || rateLimitFailure)) || timedOut;
+
+          if (shouldRotate) {
+            // Mark current profile for cooldown before rotating
+            if (lastProfileId) {
+              markAuthProfileCooldown({
+                store: authStore,
+                profileId: lastProfileId,
+              });
+              if (timedOut) {
+                log.warn(
+                  `Profile ${lastProfileId} timed out (possible rate limit). Trying next account...`,
+                );
+              }
+            }
+            const rotated = await advanceAuthProfile();
+            if (rotated) {
+              continue;
+            }
+            if (fallbackConfigured) {
+              const message =
+                lastAssistant?.errorMessage?.trim() ||
+                (lastAssistant
+                  ? formatAssistantErrorText(lastAssistant)
+                  : "") ||
+                (timedOut
+                  ? "LLM request timed out."
+                  : rateLimitFailure
+                    ? "LLM request rate limited."
+                    : "LLM request unauthorized.");
+              throw new Error(message);
+            }
           }
 
           const usage = lastAssistant?.usage;
@@ -717,6 +1059,15 @@ export async function runEmbeddedPiAgent(params: {
           log.debug(
             `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
           );
+          if (lastProfileId) {
+            markAuthProfileGood({
+              store: authStore,
+              provider,
+              profileId: lastProfileId,
+            });
+            // Track usage for round-robin rotation
+            markAuthProfileUsed({ store: authStore, profileId: lastProfileId });
+          }
           return {
             payloads: payloads.length ? payloads : undefined,
             meta: {

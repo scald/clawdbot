@@ -244,6 +244,63 @@ describe("partial reply gating", () => {
   });
 });
 
+describe("typing controller idle", () => {
+  it("marks dispatch idle after replies flush", async () => {
+    const markDispatchIdle = vi.fn();
+    const typingMock = {
+      onReplyStart: vi.fn(async () => {}),
+      startTypingLoop: vi.fn(async () => {}),
+      startTypingOnText: vi.fn(async () => {}),
+      refreshTypingTtl: vi.fn(),
+      markRunComplete: vi.fn(),
+      markDispatchIdle,
+      cleanup: vi.fn(),
+    };
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn().mockResolvedValue(undefined);
+    const sendMedia = vi.fn().mockResolvedValue(undefined);
+
+    const replyResolver = vi.fn().mockImplementation(async (_ctx, opts) => {
+      opts?.onTypingController?.(typingMock);
+      return { text: "final reply" };
+    });
+
+    const mockConfig: ClawdbotConfig = {
+      whatsapp: {
+        allowFrom: ["*"],
+      },
+    };
+
+    setLoadConfigMock(mockConfig);
+
+    await monitorWebProvider(
+      false,
+      async ({ onMessage }) => {
+        await onMessage({
+          id: "m1",
+          from: "+1000",
+          conversationId: "+1000",
+          to: "+2000",
+          body: "hello",
+          timestamp: Date.now(),
+          chatType: "direct",
+          chatId: "direct:+1000",
+          sendComposing,
+          reply,
+          sendMedia,
+        });
+        return { close: vi.fn().mockResolvedValue(undefined) };
+      },
+      false,
+      replyResolver,
+    );
+
+    resetLoadConfigMock();
+
+    expect(markDispatchIdle).toHaveBeenCalled();
+  });
+});
+
 describe("web auto-reply", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1042,6 +1099,57 @@ describe("web auto-reply", () => {
     });
 
     expect(resolver).toHaveBeenCalledTimes(1);
+    resetLoadConfigMock();
+  });
+
+  it("blocks group messages when whatsapp groups is set without a wildcard", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    setLoadConfigMock(() => ({
+      whatsapp: {
+        allowFrom: ["*"],
+        groups: { "999@g.us": { requireMention: false } },
+      },
+      routing: { groupChat: { mentionPatterns: ["@clawd"] } },
+    }));
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebProvider(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "@clawd hello",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g-allowlist-block",
+      senderE164: "+111",
+      senderName: "Alice",
+      mentionedJids: ["999@s.whatsapp.net"],
+      selfE164: "+999",
+      selfJid: "999@s.whatsapp.net",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).not.toHaveBeenCalled();
     resetLoadConfigMock();
   });
 
