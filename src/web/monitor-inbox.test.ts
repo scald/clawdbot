@@ -16,13 +16,16 @@ const mockLoadConfig = vi.fn().mockReturnValue({
   messages: {
     messagePrefix: undefined,
     responsePrefix: undefined,
-    timestampPrefix: false,
   },
 });
 
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => mockLoadConfig(),
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => mockLoadConfig(),
+  };
+});
 
 vi.mock("./session.js", () => {
   const { EventEmitter } = require("node:events");
@@ -476,7 +479,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -532,7 +534,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -572,7 +573,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -588,7 +588,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -624,7 +623,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -639,7 +637,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -681,7 +678,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -705,7 +701,11 @@ describe("web monitor inbox", () => {
 
     // Should call onMessage for authorized senders
     expect(onMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ body: "authorized message", from: "+999" }),
+      expect.objectContaining({
+        body: "authorized message",
+        from: "+999",
+        senderE164: "+999",
+      }),
     );
 
     // Reset mock for other tests
@@ -716,7 +716,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -733,7 +732,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -769,7 +767,6 @@ describe("web monitor inbox", () => {
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -836,9 +833,44 @@ it("defaults to self-only when no config is present", async () => {
     messages: {
       messagePrefix: undefined,
       responsePrefix: undefined,
-      timestampPrefix: false,
     },
   });
+
+  await listener.close();
+});
+
+it("handles append messages by marking them read but skipping auto-reply", async () => {
+  const onMessage = vi.fn();
+  const listener = await monitorWebInbox({ verbose: false, onMessage });
+  const sock = await createWaSocket();
+
+  const upsert = {
+    type: "append",
+    messages: [
+      {
+        key: { id: "history1", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+        message: { conversation: "old message" },
+        messageTimestamp: 1_700_000_000,
+        pushName: "History Sender",
+      },
+    ],
+  };
+
+  sock.ev.emit("messages.upsert", upsert);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Verify it WAS marked as read
+  expect(sock.readMessages).toHaveBeenCalledWith([
+    {
+      remoteJid: "999@s.whatsapp.net",
+      id: "history1",
+      participant: undefined,
+      fromMe: false,
+    },
+  ]);
+
+  // Verify it WAS NOT passed to onMessage
+  expect(onMessage).not.toHaveBeenCalled();
 
   await listener.close();
 });

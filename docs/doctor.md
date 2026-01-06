@@ -15,6 +15,7 @@ read_when:
 - Migrates legacy `~/.clawdis/clawdis.json` when no Clawdbot config exists.
 - Checks sandbox Docker images when sandboxing is enabled (offers to build or switch to legacy names).
 - Detects legacy Clawdis services (launchd/systemd/schtasks) and offers to migrate them.
+- On Linux, checks if systemd user lingering is enabled and can enable it (required to keep the Gateway alive after logout).
 
 ## Legacy config file migration
 If `~/.clawdis/clawdis.json` exists and `~/.clawdbot/clawdbot.json` does not, doctor will migrate the file and normalize old paths/image names.
@@ -26,8 +27,13 @@ Doctor will:
 - Show the migration it applied.
 - Rewrite `~/.clawdbot/clawdbot.json` with the updated schema.
 
+The Gateway also auto-runs doctor migrations on startup when it detects a legacy
+config format, so stale configs are repaired without manual intervention.
+
 Current migrations:
 - `routing.allowFrom` → `whatsapp.allowFrom`
+- `agent.model`/`allowedModels`/`modelAliases`/`modelFallbacks`/`imageModelFallbacks`
+  → `agent.models` + `agent.model.primary/fallbacks` + `agent.imageModel.primary/fallbacks`
 
 ## Usage
 

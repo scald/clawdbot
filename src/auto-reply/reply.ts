@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { resolveModelRefFromString } from "../agents/model-selection.js";
 import {
@@ -7,6 +10,8 @@ import {
   isEmbeddedPiRunStreaming,
   resolveEmbeddedSessionLane,
 } from "../agents/pi-embedded.js";
+import { ensureSandboxWorkspaceForSession } from "../agents/sandbox.js";
+import { resolveAgentTimeoutMs } from "../agents/timeout.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
   ensureAgentWorkspace,
@@ -20,6 +25,8 @@ import { resolveSessionTranscriptPath } from "../config/sessions.js";
 import { logVerbose } from "../globals.js";
 import { clearCommandLane, getQueueSize } from "../process/command-queue.js";
 import { defaultRuntime } from "../runtime.js";
+import { resolveCommandAuthorization } from "./command-auth.js";
+import { hasControlCommand } from "./command-detection.js";
 import { getAbortMemory } from "./reply/abort.js";
 import { runReplyAgent } from "./reply/agent-runner.js";
 import { resolveBlockStreamingChunking } from "./reply/block-streaming.js";
@@ -37,6 +44,7 @@ import {
   defaultGroupActivation,
   resolveGroupRequireMention,
 } from "./reply/groups.js";
+import { stripMentions } from "./reply/mentions.js";
 import {
   createModelSelectionState,
   resolveContextTokens,
@@ -48,7 +56,7 @@ import {
   prependSystemEvents,
 } from "./reply/session-updates.js";
 import { createTypingController } from "./reply/typing.js";
-import type { MsgContext } from "./templating.js";
+import type { MsgContext, TemplateContext } from "./templating.js";
 import {
   type ElevatedLevel,
   normalizeThinkLevel,
@@ -70,6 +78,9 @@ export type { GetReplyOptions, ReplyPayload } from "./types.js";
 
 const BARE_SESSION_RESET_PROMPT =
   "A new session was started via /new or /reset. Say hi briefly (1-2 sentences) and ask what the user wants to do next. Do not mention internal steps, files, tools, or reasoning.";
+
+const CONTROL_COMMAND_PREFIX_RE =
+  /^\/(?:status|help|thinking|think|t|verbose|v|elevated|elev|model|queue|activation|send|restart|reset|new|compact)\b/i;
 
 function normalizeAllowToken(value?: string) {
   if (!value) return "";
@@ -211,8 +222,7 @@ export async function getReplyFromConfig(
     ensureBootstrapFiles: true,
   });
   const workspaceDir = workspace.dir;
-  const timeoutSeconds = Math.max(agentCfg?.timeoutSeconds ?? 600, 1);
-  const timeoutMs = timeoutSeconds * 1000;
+  const timeoutMs = resolveAgentTimeoutMs({ cfg });
   const configuredTypingSeconds =
     agentCfg?.typingIntervalSeconds ?? sessionCfg?.typingIntervalSeconds;
   const typingIntervalSeconds =
@@ -223,6 +233,7 @@ export async function getReplyFromConfig(
     silentToken: SILENT_REPLY_TOKEN,
     log: defaultRuntime.log,
   });
+  opts?.onTypingController?.(typing);
 
   let transcribedText: string | undefined;
   if (cfg.routing?.transcribeAudio && isAudio(ctx.MediaType)) {
@@ -235,7 +246,17 @@ export async function getReplyFromConfig(
     }
   }
 
-  const sessionState = await initSessionState({ ctx, cfg });
+  const commandAuthorized = ctx.CommandAuthorized ?? true;
+  const commandAuth = resolveCommandAuthorization({
+    ctx,
+    cfg,
+    commandAuthorized,
+  });
+  const sessionState = await initSessionState({
+    ctx,
+    cfg,
+    commandAuthorized,
+  });
   let {
     sessionCtx,
     sessionEntry,
@@ -252,11 +273,21 @@ export async function getReplyFromConfig(
     triggerBodyNormalized,
   } = sessionState;
 
-  const directives = parseInlineDirectives(
-    sessionCtx.BodyStripped ?? sessionCtx.Body ?? "",
-  );
-  sessionCtx.Body = directives.cleaned;
-  sessionCtx.BodyStripped = directives.cleaned;
+  const rawBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
+  const parsedDirectives = parseInlineDirectives(rawBody);
+  const directives = commandAuthorized
+    ? parsedDirectives
+    : {
+        ...parsedDirectives,
+        hasThinkDirective: false,
+        hasVerboseDirective: false,
+        hasStatusDirective: false,
+        hasModelDirective: false,
+        hasQueueDirective: false,
+        queueReset: false,
+      };
+  sessionCtx.Body = parsedDirectives.cleaned;
+  sessionCtx.BodyStripped = parsedDirectives.cleaned;
 
   const surfaceKey =
     sessionCtx.Surface?.trim().toLowerCase() ??
@@ -345,7 +376,9 @@ export async function getReplyFromConfig(
       : `Model switched to ${label}.`;
   const isModelListAlias =
     directives.hasModelDirective &&
-    directives.rawModelDirective?.trim().toLowerCase() === "status";
+    ["status", "list"].includes(
+      directives.rawModelDirective?.trim().toLowerCase() ?? "",
+    );
   const effectiveModelDirective = isModelListAlias
     ? undefined
     : directives.rawModelDirective;
@@ -360,6 +393,7 @@ export async function getReplyFromConfig(
     })
   ) {
     const directiveReply = await handleDirectiveOnly({
+      cfg,
       directives,
       sessionEntry,
       sessionStore,
@@ -385,6 +419,7 @@ export async function getReplyFromConfig(
   const persisted = await persistInlineDirectives({
     directives,
     effectiveModelDirective,
+    cfg,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -424,6 +459,7 @@ export async function getReplyFromConfig(
     sessionKey,
     isGroup,
     triggerBodyNormalized,
+    commandAuthorized,
   });
   const isEmptyConfig = Object.keys(cfg).length === 0;
   if (
@@ -445,6 +481,7 @@ export async function getReplyFromConfig(
     ctx,
     cfg,
     command,
+    directives,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -454,6 +491,7 @@ export async function getReplyFromConfig(
     defaultGroupActivation: () => defaultActivation,
     resolvedThinkLevel,
     resolvedVerboseLevel: resolvedVerboseLevel ?? "off",
+    resolvedElevatedLevel,
     resolveDefaultThinkingLevel: modelState.resolveDefaultThinkingLevel,
     provider,
     model,
@@ -464,6 +502,15 @@ export async function getReplyFromConfig(
     typing.cleanup();
     return commandResult.reply;
   }
+
+  await stageSandboxMedia({
+    ctx,
+    sessionCtx,
+    cfg,
+    sessionKey,
+    workspaceDir,
+  });
+
   const isFirstTurnInSession = isNewSession || !systemSent;
   const isGroupChat = sessionCtx.ChatType === "group";
   const wasMentioned = ctx.WasMentioned === true;
@@ -484,6 +531,20 @@ export async function getReplyFromConfig(
   const baseBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
   const rawBodyTrimmed = (ctx.Body ?? "").trim();
   const baseBodyTrimmedRaw = baseBody.trim();
+  const strippedCommandBody = isGroup
+    ? stripMentions(triggerBodyNormalized, ctx, cfg)
+    : triggerBodyNormalized;
+  if (
+    !commandAuth.isAuthorizedSender &&
+    CONTROL_COMMAND_PREFIX_RE.test(strippedCommandBody.trim())
+  ) {
+    typing.cleanup();
+    return undefined;
+  }
+  if (!commandAuthorized && !baseBodyTrimmedRaw && hasControlCommand(rawBody)) {
+    typing.cleanup();
+    return undefined;
+  }
   const isBareSessionReset =
     isNewSession &&
     baseBodyTrimmedRaw.length === 0 &&
@@ -602,6 +663,7 @@ export async function getReplyFromConfig(
     resolvedQueue.mode === "followup" ||
     resolvedQueue.mode === "collect" ||
     resolvedQueue.mode === "steer-backlog";
+  const authProfileId = sessionEntry?.authProfileOverride;
   const followupRun = {
     prompt: queuedBody,
     summaryLine: baseBodyTrimmedRaw,
@@ -616,6 +678,7 @@ export async function getReplyFromConfig(
       skillsSnapshot,
       provider,
       model,
+      authProfileId,
       thinkLevel: resolvedThinkLevel,
       verboseLevel: resolvedVerboseLevel,
       elevatedLevel: resolvedElevatedLevel,
@@ -662,4 +725,66 @@ export async function getReplyFromConfig(
     sessionCtx,
     shouldInjectGroupIntro,
   });
+}
+
+async function stageSandboxMedia(params: {
+  ctx: MsgContext;
+  sessionCtx: TemplateContext;
+  cfg: ClawdbotConfig;
+  sessionKey?: string;
+  workspaceDir: string;
+}) {
+  const { ctx, sessionCtx, cfg, sessionKey, workspaceDir } = params;
+  const rawPath = ctx.MediaPath?.trim();
+  if (!rawPath || !sessionKey) return;
+
+  const sandbox = await ensureSandboxWorkspaceForSession({
+    config: cfg,
+    sessionKey,
+    workspaceDir,
+  });
+  if (!sandbox) return;
+
+  let source = rawPath;
+  if (source.startsWith("file://")) {
+    try {
+      source = fileURLToPath(source);
+    } catch {
+      return;
+    }
+  }
+  if (!path.isAbsolute(source)) return;
+
+  const originalMediaPath = ctx.MediaPath;
+  const originalMediaUrl = ctx.MediaUrl;
+
+  try {
+    const fileName = path.basename(source);
+    if (!fileName) return;
+    const destDir = path.join(sandbox.workspaceDir, "media", "inbound");
+    await fs.mkdir(destDir, { recursive: true });
+    const dest = path.join(destDir, fileName);
+    await fs.copyFile(source, dest);
+
+    const relative = path.posix.join("media", "inbound", fileName);
+    ctx.MediaPath = relative;
+    sessionCtx.MediaPath = relative;
+
+    if (originalMediaUrl) {
+      let normalizedUrl = originalMediaUrl;
+      if (normalizedUrl.startsWith("file://")) {
+        try {
+          normalizedUrl = fileURLToPath(normalizedUrl);
+        } catch {
+          normalizedUrl = originalMediaUrl;
+        }
+      }
+      if (normalizedUrl === originalMediaPath || normalizedUrl === source) {
+        ctx.MediaUrl = relative;
+        sessionCtx.MediaUrl = relative;
+      }
+    }
+  } catch (err) {
+    logVerbose(`Failed to stage inbound media for sandbox: ${String(err)}`);
+  }
 }

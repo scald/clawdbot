@@ -1,12 +1,29 @@
 import path from "node:path";
 
-import { loginAnthropic, type OAuthCredentials } from "@mariozechner/pi-ai";
+import {
+  loginAnthropic,
+  loginOpenAICodex,
+  type OAuthCredentials,
+  type OAuthProvider,
+} from "@mariozechner/pi-ai";
+import {
+  ensureAuthProfileStore,
+  listProfilesForProvider,
+} from "../agents/auth-profiles.js";
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
+import {
+  getCustomProviderApiKey,
+  resolveEnvApiKey,
+} from "../agents/model-auth.js";
+import { loadModelCatalog } from "../agents/model-catalog.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import {
   isRemoteEnvironment,
   loginAntigravityVpsAware,
 } from "../commands/antigravity-oauth.js";
 import { healthCommand } from "../commands/health.js";
 import {
+  applyAuthProfileConfig,
   applyMinimaxConfig,
   setAnthropicApiKey,
   writeOAuthCredentials,
@@ -35,6 +52,7 @@ import type {
   OnboardOptions,
   ResetScope,
 } from "../commands/onboard-types.js";
+import { ensureSystemdUserLingerInteractive } from "../commands/systemd-linger.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
   CONFIG_PATH_CLAWDBOT,
@@ -42,6 +60,7 @@ import {
   resolveGatewayPort,
   writeConfigFile,
 } from "../config/config.js";
+import type { AgentModelListConfig } from "../config/types.js";
 import { GATEWAY_LAUNCH_AGENT_LABEL } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
 import { resolveGatewayService } from "../daemon/service.js";
@@ -50,6 +69,96 @@ import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath, sleep } from "../utils.js";
 import type { WizardPrompter } from "./prompts.js";
+
+const OPENAI_CODEX_DEFAULT_MODEL = "openai-codex/gpt-5.2";
+
+function shouldSetOpenAICodexModel(model?: string): boolean {
+  const trimmed = model?.trim();
+  if (!trimmed) return true;
+  const normalized = trimmed.toLowerCase();
+  if (normalized.startsWith("openai-codex/")) return false;
+  if (normalized.startsWith("openai/")) return true;
+  return normalized === "gpt" || normalized === "gpt-mini";
+}
+
+function resolvePrimaryModel(
+  model?: AgentModelListConfig | string,
+): string | undefined {
+  if (typeof model === "string") return model;
+  if (model && typeof model === "object" && typeof model.primary === "string") {
+    return model.primary;
+  }
+  return undefined;
+}
+
+function applyOpenAICodexModelDefault(cfg: ClawdbotConfig): {
+  next: ClawdbotConfig;
+  changed: boolean;
+} {
+  const current = resolvePrimaryModel(cfg.agent?.model);
+  if (!shouldSetOpenAICodexModel(current)) {
+    return { next: cfg, changed: false };
+  }
+  return {
+    next: {
+      ...cfg,
+      agent: {
+        ...cfg.agent,
+        model:
+          cfg.agent?.model && typeof cfg.agent.model === "object"
+            ? { ...cfg.agent.model, primary: OPENAI_CODEX_DEFAULT_MODEL }
+            : { primary: OPENAI_CODEX_DEFAULT_MODEL },
+      },
+    },
+    changed: true,
+  };
+}
+
+async function warnIfModelConfigLooksOff(
+  config: ClawdbotConfig,
+  prompter: WizardPrompter,
+) {
+  const ref = resolveConfiguredModelRef({
+    cfg: config,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
+  const warnings: string[] = [];
+  const catalog = await loadModelCatalog({ config, useCache: false });
+  if (catalog.length > 0) {
+    const known = catalog.some(
+      (entry) => entry.provider === ref.provider && entry.id === ref.model,
+    );
+    if (!known) {
+      warnings.push(
+        `Model not found: ${ref.provider}/${ref.model}. Update agent.model or run /models list.`,
+      );
+    }
+  }
+
+  const store = ensureAuthProfileStore();
+  const hasProfile = listProfilesForProvider(store, ref.provider).length > 0;
+  const envKey = resolveEnvApiKey(ref.provider);
+  const customKey = getCustomProviderApiKey(config, ref.provider);
+  if (!hasProfile && !envKey && !customKey) {
+    warnings.push(
+      `No auth configured for provider "${ref.provider}". The agent may fail until credentials are added.`,
+    );
+  }
+
+  if (ref.provider === "openai") {
+    const hasCodex = listProfilesForProvider(store, "openai-codex").length > 0;
+    if (hasCodex) {
+      warnings.push(
+        `Detected OpenAI Codex OAuth. Consider setting agent.model to ${OPENAI_CODEX_DEFAULT_MODEL}.`,
+      );
+    }
+  }
+
+  if (warnings.length > 0) {
+    await prompter.note(warnings.join("\n"), "Model check");
+  }
+}
 
 export async function runOnboardingWizard(
   opts: OnboardOptions,
@@ -185,6 +294,7 @@ export async function runOnboardingWizard(
     message: "Model/auth choice",
     options: [
       { value: "oauth", label: "Anthropic OAuth (Claude Pro/Max)" },
+      { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
       {
         value: "antigravity",
         label: "Google Antigravity (Claude Opus 4.5, Gemini 3, etc.)",
@@ -219,9 +329,77 @@ export async function runOnboardingWizard(
       spin.stop("OAuth complete");
       if (oauthCreds) {
         await writeOAuthCredentials("anthropic", oauthCreds);
+        nextConfig = applyAuthProfileConfig(nextConfig, {
+          profileId: "anthropic:default",
+          provider: "anthropic",
+          mode: "oauth",
+        });
       }
     } catch (err) {
       spin.stop("OAuth failed");
+      runtime.error(String(err));
+    }
+  } else if (authChoice === "openai-codex") {
+    const isRemote = isRemoteEnvironment();
+    await prompter.note(
+      isRemote
+        ? [
+            "You are running in a remote/VPS environment.",
+            "A URL will be shown for you to open in your LOCAL browser.",
+            "After signing in, paste the redirect URL back here.",
+          ].join("\n")
+        : [
+            "Browser will open for OpenAI authentication.",
+            "If the callback doesn't auto-complete, paste the redirect URL.",
+            "OpenAI OAuth uses localhost:1455 for the callback.",
+          ].join("\n"),
+      "OpenAI Codex OAuth",
+    );
+    const spin = prompter.progress("Starting OAuth flow…");
+    try {
+      const creds = await loginOpenAICodex({
+        onAuth: async ({ url }) => {
+          if (isRemote) {
+            spin.stop("OAuth URL ready");
+            runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
+          } else {
+            spin.update("Complete sign-in in browser…");
+            await openUrl(url);
+            runtime.log(`Open: ${url}`);
+          }
+        },
+        onPrompt: async (prompt) => {
+          const code = await prompter.text({
+            message: prompt.message,
+            placeholder: prompt.placeholder,
+            validate: (value) => (value?.trim() ? undefined : "Required"),
+          });
+          return String(code);
+        },
+        onProgress: (msg) => spin.update(msg),
+      });
+      spin.stop("OpenAI OAuth complete");
+      if (creds) {
+        await writeOAuthCredentials(
+          "openai-codex" as unknown as OAuthProvider,
+          creds,
+        );
+        nextConfig = applyAuthProfileConfig(nextConfig, {
+          profileId: "openai-codex:default",
+          provider: "openai-codex",
+          mode: "oauth",
+        });
+        const applied = applyOpenAICodexModelDefault(nextConfig);
+        nextConfig = applied.next;
+        if (applied.changed) {
+          await prompter.note(
+            `Default model set to ${OPENAI_CODEX_DEFAULT_MODEL}`,
+            "Model configured",
+          );
+        }
+      }
+    } catch (err) {
+      spin.stop("OpenAI OAuth failed");
       runtime.error(String(err));
     }
   } else if (authChoice === "antigravity") {
@@ -259,11 +437,33 @@ export async function runOnboardingWizard(
       spin.stop("Antigravity OAuth complete");
       if (oauthCreds) {
         await writeOAuthCredentials("google-antigravity", oauthCreds);
+        nextConfig = applyAuthProfileConfig(nextConfig, {
+          profileId: "google-antigravity:default",
+          provider: "google-antigravity",
+          mode: "oauth",
+        });
         nextConfig = {
           ...nextConfig,
           agent: {
             ...nextConfig.agent,
-            model: "google-antigravity/claude-opus-4-5-thinking",
+            model: {
+              ...(nextConfig.agent?.model &&
+              "fallbacks" in (nextConfig.agent.model as Record<string, unknown>)
+                ? {
+                    fallbacks: (
+                      nextConfig.agent.model as { fallbacks?: string[] }
+                    ).fallbacks,
+                  }
+                : undefined),
+              primary: "google-antigravity/claude-opus-4-5-thinking",
+            },
+            models: {
+              ...nextConfig.agent?.models,
+              "google-antigravity/claude-opus-4-5-thinking":
+                nextConfig.agent?.models?.[
+                  "google-antigravity/claude-opus-4-5-thinking"
+                ] ?? {},
+            },
           },
         };
         await prompter.note(
@@ -281,9 +481,16 @@ export async function runOnboardingWizard(
       validate: (value) => (value?.trim() ? undefined : "Required"),
     });
     await setAnthropicApiKey(String(key).trim());
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "anthropic:default",
+      provider: "anthropic",
+      mode: "api_key",
+    });
   } else if (authChoice === "minimax") {
     nextConfig = applyMinimaxConfig(nextConfig);
   }
+
+  await warnIfModelConfigLooksOff(nextConfig, prompter);
 
   const portRaw = await prompter.text({
     message: "Gateway port",
@@ -433,6 +640,17 @@ export async function runOnboardingWizard(
   nextConfig = await setupSkills(nextConfig, workspaceDir, runtime, prompter);
   nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
   await writeConfigFile(nextConfig);
+
+  await ensureSystemdUserLingerInteractive({
+    runtime,
+    prompter: {
+      confirm: prompter.confirm,
+      note: prompter.note,
+    },
+    reason:
+      "Linux installs use a systemd user service by default. Without lingering, systemd stops the user session on logout/idle and kills the Gateway.",
+    requireConfirm: false,
+  });
 
   const installDaemon = await prompter.confirm({
     message: "Install Gateway daemon (recommended)",

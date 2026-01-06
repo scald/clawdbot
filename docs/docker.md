@@ -59,6 +59,12 @@ docker compose exec clawdbot-gateway node dist/index.js health --token "$CLAWDBO
 scripts/e2e/onboard-docker.sh
 ```
 
+### QR import smoke test (Docker)
+
+```bash
+pnpm test:docker:qr
+```
+
 ### Notes
 
 - Gateway bind defaults to `lan` for container use.
@@ -73,6 +79,7 @@ container. The gateway stays on your host, but the tool execution is isolated:
 - one container per session (hard wall)
 - per-session workspace folder mounted at `/workspace`
 - allow/deny tool policy (deny wins)
+- inbound media is copied into the sandbox workspace (`media/inbound/*`) so tools can read it
 
 ### Default behavior
 

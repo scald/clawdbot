@@ -13,6 +13,9 @@ const forceFreePortAndWait = vi.fn(async () => ({
   waitedMs: 0,
   escalatedToSigkill: false,
 }));
+const serviceStop = vi.fn().mockResolvedValue(undefined);
+const serviceRestart = vi.fn().mockResolvedValue(undefined);
+const serviceIsLoaded = vi.fn().mockResolvedValue(true);
 
 const runtimeLogs: string[] = [];
 const runtimeErrors: string[] = [];
@@ -23,6 +26,28 @@ const defaultRuntime = {
     throw new Error(`__exit__:${code}`);
   },
 };
+
+async function withEnvOverride<T>(
+  overrides: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) {
+    saved[key] = process.env[key];
+    if (overrides[key] === undefined) delete process.env[key];
+    else process.env[key] = overrides[key];
+  }
+  vi.resetModules();
+  try {
+    return await fn();
+  } finally {
+    for (const key of Object.keys(saved)) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    vi.resetModules();
+  }
+}
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: (opts: unknown) => callGateway(opts),
@@ -50,6 +75,20 @@ vi.mock("./deps.js", () => ({
 
 vi.mock("./ports.js", () => ({
   forceFreePortAndWait: (port: number) => forceFreePortAndWait(port),
+}));
+
+vi.mock("../daemon/service.js", () => ({
+  resolveGatewayService: () => ({
+    label: "LaunchAgent",
+    loadedText: "loaded",
+    notLoadedText: "not loaded",
+    install: vi.fn(),
+    uninstall: vi.fn(),
+    stop: serviceStop,
+    restart: serviceRestart,
+    isLoaded: serviceIsLoaded,
+    readCommand: vi.fn(),
+  }),
 }));
 
 describe("gateway-cli coverage", () => {
@@ -204,5 +243,72 @@ describe("gateway-cli coverage", () => {
       if (!beforeSigint.has(listener))
         process.removeListener("SIGINT", listener);
     }
+  });
+
+  it("supports gateway stop/restart via service helper", async () => {
+    runtimeLogs.length = 0;
+    runtimeErrors.length = 0;
+    serviceStop.mockClear();
+    serviceRestart.mockClear();
+    serviceIsLoaded.mockResolvedValue(true);
+
+    const { registerGatewayCli } = await import("./gateway-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerGatewayCli(program);
+
+    await program.parseAsync(["gateway", "stop"], { from: "user" });
+    await program.parseAsync(["gateway", "restart"], { from: "user" });
+
+    expect(serviceStop).toHaveBeenCalledTimes(1);
+    expect(serviceRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it("prints stop hints on GatewayLockError when service is loaded", async () => {
+    runtimeLogs.length = 0;
+    runtimeErrors.length = 0;
+    serviceIsLoaded.mockResolvedValue(true);
+
+    const { GatewayLockError } = await import("../infra/gateway-lock.js");
+    startGatewayServer.mockRejectedValueOnce(
+      new GatewayLockError("another gateway instance is already listening"),
+    );
+
+    const { registerGatewayCli } = await import("./gateway-cli.js");
+    const program = new Command();
+    program.exitOverride();
+    registerGatewayCli(program);
+
+    await expect(
+      program.parseAsync(["gateway", "--allow-unconfigured"], {
+        from: "user",
+      }),
+    ).rejects.toThrow("__exit__:1");
+
+    expect(startGatewayServer).toHaveBeenCalled();
+    expect(runtimeErrors.join("\n")).toContain("Gateway failed to start:");
+    expect(runtimeErrors.join("\n")).toContain("clawdbot gateway stop");
+  });
+
+  it("uses env/config port when --port is omitted", async () => {
+    await withEnvOverride({ CLAWDBOT_GATEWAY_PORT: "19001" }, async () => {
+      runtimeLogs.length = 0;
+      runtimeErrors.length = 0;
+      startGatewayServer.mockClear();
+
+      const { registerGatewayCli } = await import("./gateway-cli.js");
+      const program = new Command();
+      program.exitOverride();
+      registerGatewayCli(program);
+
+      startGatewayServer.mockRejectedValueOnce(new Error("nope"));
+      await expect(
+        program.parseAsync(["gateway", "--allow-unconfigured"], {
+          from: "user",
+        }),
+      ).rejects.toThrow("__exit__:1");
+
+      expect(startGatewayServer).toHaveBeenCalledWith(19001, expect.anything());
+    });
   });
 });

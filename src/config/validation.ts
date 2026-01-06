@@ -1,4 +1,8 @@
-import { applyIdentityDefaults, applySessionDefaults } from "./defaults.js";
+import {
+  applyIdentityDefaults,
+  applyModelDefaults,
+  applySessionDefaults,
+} from "./defaults.js";
 import { findLegacyConfigIssues } from "./legacy.js";
 import type { ClawdbotConfig, ConfigValidationIssue } from "./types.js";
 import { ClawdbotSchema } from "./zod-schema.js";
@@ -30,8 +34,10 @@ export function validateConfigObject(
   }
   return {
     ok: true,
-    config: applySessionDefaults(
-      applyIdentityDefaults(validated.data as ClawdbotConfig),
+    config: applyModelDefaults(
+      applySessionDefaults(
+        applyIdentityDefaults(validated.data as ClawdbotConfig),
+      ),
     ),
   };
 }

@@ -40,6 +40,27 @@ describe("gateway server chat", () => {
     await server.close();
   });
 
+  test("chat.send defaults to agent timeout config", async () => {
+    testState.agentConfig = { timeoutSeconds: 123 };
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res = await rpcReq(ws, "chat.send", {
+      sessionKey: "main",
+      message: "hello",
+      idempotencyKey: "idem-timeout-1",
+    });
+    expect(res.ok).toBe(true);
+
+    const call = vi.mocked(agentCommand).mock.calls.at(-1)?.[0] as
+      | { timeout?: string }
+      | undefined;
+    expect(call?.timeout).toBe("123");
+
+    ws.close();
+    await server.close();
+  });
+
   test("chat.send blocked by send policy", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-gw-"));
     testState.sessionStorePath = path.join(dir, "sessions.json");
@@ -830,9 +851,9 @@ describe("gateway server chat", () => {
     );
 
     emitAgentEvent({
-      runId: "sess-main",
-      stream: "job",
-      data: { state: "done" },
+      runId: "idem-1",
+      stream: "lifecycle",
+      data: { phase: "end" },
     });
 
     const final1 = await final1P;
@@ -852,9 +873,9 @@ describe("gateway server chat", () => {
     );
 
     emitAgentEvent({
-      runId: "sess-main",
-      stream: "job",
-      data: { state: "done" },
+      runId: "idem-2",
+      stream: "lifecycle",
+      data: { phase: "end" },
     });
 
     const final2 = await final2P;

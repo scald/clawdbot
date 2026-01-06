@@ -14,12 +14,13 @@ import {
 } from "../agents/usage.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
+  resolveMainSessionKey,
   resolveSessionTranscriptPath,
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
 import { shortenHomePath } from "../utils.js";
-import type { ThinkLevel, VerboseLevel } from "./thinking.js";
+import type { ElevatedLevel, ThinkLevel, VerboseLevel } from "./thinking.js";
 
 type AgentConfig = NonNullable<ClawdbotConfig["agent"]>;
 
@@ -33,6 +34,8 @@ type StatusArgs = {
   groupActivation?: "mention" | "always";
   resolvedThink?: ThinkLevel;
   resolvedVerbose?: VerboseLevel;
+  resolvedElevated?: ElevatedLevel;
+  modelAuth?: string;
   now?: number;
   webLinked?: boolean;
   webAuthAgeMs?: number | null;
@@ -53,6 +56,8 @@ const formatAge = (ms?: number | null) => {
 const formatKTokens = (value: number) =>
   `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k`;
 
+export const formatTokenCount = (value: number) => formatKTokens(value);
+
 const formatTokens = (
   total: number | null | undefined,
   contextTokens: number | null,
@@ -67,6 +72,11 @@ const formatTokens = (
   const ctxLabel = ctx ? formatKTokens(ctx) : "?";
   return `${totalLabel}/${ctxLabel}${pct !== null ? ` (${pct}%)` : ""}`;
 };
+
+export const formatContextUsageShort = (
+  total: number | null | undefined,
+  contextTokens: number | null | undefined,
+) => `Context ${formatTokens(total, contextTokens ?? null)}`;
 
 const readUsageFromSessionLog = (
   sessionId?: string,
@@ -164,7 +174,30 @@ export function buildStatusMessage(args: StatusArgs): string {
   const verboseLevel =
     args.resolvedVerbose ?? args.agent?.verboseDefault ?? "off";
   const elevatedLevel =
-    args.sessionEntry?.elevatedLevel ?? args.agent?.elevatedDefault ?? "on";
+    args.resolvedElevated ??
+    args.sessionEntry?.elevatedLevel ??
+    args.agent?.elevatedDefault ??
+    "on";
+
+  const runtime = (() => {
+    const sandboxMode = args.agent?.sandbox?.mode ?? "off";
+    if (sandboxMode === "off")
+      return { line: "Runtime: direct", sandboxed: false };
+    const sessionScope = args.sessionScope ?? "per-sender";
+    const mainKey = resolveMainSessionKey({
+      session: { scope: sessionScope },
+    });
+    const sessionKey = args.sessionKey?.trim();
+    const sandboxed = sessionKey
+      ? sandboxMode === "all" || sessionKey !== mainKey.trim()
+      : false;
+    const runtime = sandboxed ? "docker" : sessionKey ? "direct" : "unknown";
+    const suffix = sandboxed ? ` • elevated ${elevatedLevel}` : "";
+    return {
+      line: `Runtime: ${runtime} (sandbox ${sandboxMode})${suffix}`,
+      sandboxed,
+    };
+  })();
 
   const webLine = (() => {
     if (args.webLinked === false) {
@@ -184,6 +217,9 @@ export function buildStatusMessage(args: StatusArgs): string {
     entry?.updatedAt
       ? `updated ${formatAge(now - entry.updatedAt)}`
       : "no activity",
+    typeof entry?.compactionCount === "number"
+      ? `compactions ${entry.compactionCount}`
+      : undefined,
     args.storePath ? `store ${shortenHomePath(args.storePath)}` : undefined,
   ]
     .filter(Boolean)
@@ -204,27 +240,39 @@ export function buildStatusMessage(args: StatusArgs): string {
     contextTokens ?? null,
   )}${entry?.abortedLastRun ? " • last run aborted" : ""}`;
 
-  const optionsLine = `Options: thinking=${thinkLevel} | verbose=${verboseLevel} | elevated=${elevatedLevel} (set with /think <level>, /verbose on|off, /elevated on|off, /model <id>)`;
+  const optionsLine = runtime.sandboxed
+    ? `Options: thinking=${thinkLevel} | verbose=${verboseLevel} | elevated=${elevatedLevel}`
+    : `Options: thinking=${thinkLevel} | verbose=${verboseLevel}`;
 
   const modelLabel = model ? `${provider}/${model}` : "unknown";
 
   const agentLine = `Agent: embedded pi • ${modelLabel}`;
+  const authLine = args.modelAuth ? `Model auth: ${args.modelAuth}` : undefined;
 
   const workspaceLine = args.workspaceDir
     ? `Workspace: ${shortenHomePath(args.workspaceDir)}`
     : undefined;
 
-  const helpersLine = "Shortcuts: /new reset | /restart relink";
-
   return [
     "⚙️ Status",
     webLine,
     agentLine,
+    authLine,
+    runtime.line,
     workspaceLine,
     contextLine,
     sessionLine,
     groupActivationLine,
     optionsLine,
-    helpersLine,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function buildHelpMessage(): string {
+  return [
+    "ℹ️ Help",
+    "Shortcuts: /new reset | /compact [instructions] | /restart relink",
+    "Options: /think <level> | /verbose on|off | /elevated on|off | /model <id>",
   ].join("\n");
 }

@@ -1,9 +1,20 @@
+import { resolveClawdbotAgentDir } from "../../agents/agent-paths.js";
+import {
+  resolveAuthProfileDisplayLabel,
+  resolveAuthStorePathForDisplay,
+} from "../../agents/auth-profiles.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "../../agents/defaults.js";
+import {
+  ensureAuthProfileStore,
+  getCustomProviderApiKey,
+  resolveAuthProfileOrder,
+  resolveEnvApiKey,
+} from "../../agents/model-auth.js";
 import {
   buildModelAliasIndex,
   type ModelAliasIndex,
@@ -14,12 +25,14 @@ import {
 import type { ClawdbotConfig } from "../../config/config.js";
 import { type SessionEntry, saveSessionStore } from "../../config/sessions.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import { shortenHomePath } from "../../utils.js";
 import { extractModelDirective } from "../model.js";
 import type { MsgContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import {
   type ElevatedLevel,
   extractElevatedDirective,
+  extractStatusDirective,
   extractThinkDirective,
   extractVerboseDirective,
   type ThinkLevel,
@@ -38,6 +51,102 @@ import {
 
 const SYSTEM_MARK = "⚙️";
 
+const maskApiKey = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) return "missing";
+  if (trimmed.length <= 16) return trimmed;
+  return `${trimmed.slice(0, 8)}...${trimmed.slice(-8)}`;
+};
+
+const resolveAuthLabel = async (
+  provider: string,
+  cfg: ClawdbotConfig,
+  modelsPath: string,
+): Promise<{ label: string; source: string }> => {
+  const formatPath = (value: string) => shortenHomePath(value);
+  const store = ensureAuthProfileStore();
+  const order = resolveAuthProfileOrder({ cfg, store, provider });
+  if (order.length > 0) {
+    const labels = order.map((profileId) => {
+      const profile = store.profiles[profileId];
+      const configProfile = cfg.auth?.profiles?.[profileId];
+      if (
+        !profile ||
+        (configProfile?.provider &&
+          configProfile.provider !== profile.provider) ||
+        (configProfile?.mode && configProfile.mode !== profile.type)
+      ) {
+        return `${profileId}=missing`;
+      }
+      if (profile.type === "api_key") {
+        return `${profileId}=${maskApiKey(profile.key)}`;
+      }
+      const display = resolveAuthProfileDisplayLabel({
+        cfg,
+        store,
+        profileId,
+      });
+      const suffix =
+        display === profileId
+          ? ""
+          : display.startsWith(profileId)
+            ? display.slice(profileId.length).trim()
+            : `(${display})`;
+      return `${profileId}=OAuth${suffix ? ` ${suffix}` : ""}`;
+    });
+    return {
+      label: labels.join(", "),
+      source: `auth-profiles.json: ${formatPath(
+        resolveAuthStorePathForDisplay(),
+      )}`,
+    };
+  }
+
+  const envKey = resolveEnvApiKey(provider);
+  if (envKey) {
+    const isOAuthEnv =
+      envKey.source.includes("ANTHROPIC_OAUTH_TOKEN") ||
+      envKey.source.toLowerCase().includes("oauth");
+    const label = isOAuthEnv ? "OAuth (env)" : maskApiKey(envKey.apiKey);
+    return { label, source: envKey.source };
+  }
+  const customKey = getCustomProviderApiKey(cfg, provider);
+  if (customKey) {
+    return {
+      label: maskApiKey(customKey),
+      source: `models.json: ${formatPath(modelsPath)}`,
+    };
+  }
+  return { label: "missing", source: "missing" };
+};
+
+const formatAuthLabel = (auth: { label: string; source: string }) => {
+  if (!auth.source || auth.source === auth.label || auth.source === "missing") {
+    return auth.label;
+  }
+  return `${auth.label} (${auth.source})`;
+};
+
+const resolveProfileOverride = (params: {
+  rawProfile?: string;
+  provider: string;
+  cfg: ClawdbotConfig;
+}): { profileId?: string; error?: string } => {
+  const raw = params.rawProfile?.trim();
+  if (!raw) return {};
+  const store = ensureAuthProfileStore();
+  const profile = store.profiles[raw];
+  if (!profile) {
+    return { error: `Auth profile "${raw}" not found.` };
+  }
+  if (profile.provider !== params.provider) {
+    return {
+      error: `Auth profile "${raw}" is for ${profile.provider}, not ${params.provider}.`,
+    };
+  }
+  return { profileId: raw };
+};
+
 export type InlineDirectives = {
   cleaned: string;
   hasThinkDirective: boolean;
@@ -49,8 +158,10 @@ export type InlineDirectives = {
   hasElevatedDirective: boolean;
   elevatedLevel?: ElevatedLevel;
   rawElevatedLevel?: string;
+  hasStatusDirective: boolean;
   hasModelDirective: boolean;
   rawModelDirective?: string;
+  rawModelProfile?: string;
   hasQueueDirective: boolean;
   queueMode?: QueueMode;
   queueReset: boolean;
@@ -83,11 +194,14 @@ export function parseInlineDirectives(body: string): InlineDirectives {
     rawLevel: rawElevatedLevel,
     hasDirective: hasElevatedDirective,
   } = extractElevatedDirective(verboseCleaned);
+  const { cleaned: statusCleaned, hasDirective: hasStatusDirective } =
+    extractStatusDirective(elevatedCleaned);
   const {
     cleaned: modelCleaned,
     rawModel,
+    rawProfile,
     hasDirective: hasModelDirective,
-  } = extractModelDirective(elevatedCleaned);
+  } = extractModelDirective(statusCleaned);
   const {
     cleaned: queueCleaned,
     queueMode,
@@ -114,8 +228,10 @@ export function parseInlineDirectives(body: string): InlineDirectives {
     hasElevatedDirective,
     elevatedLevel,
     rawElevatedLevel,
+    hasStatusDirective,
     hasModelDirective,
     rawModelDirective: rawModel,
+    rawModelProfile: rawProfile,
     hasQueueDirective,
     queueMode,
     queueReset,
@@ -152,6 +268,7 @@ export function isDirectiveOnly(params: {
 }
 
 export async function handleDirectiveOnly(params: {
+  cfg: ClawdbotConfig;
   directives: InlineDirectives;
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;
@@ -191,11 +308,24 @@ export async function handleDirectiveOnly(params: {
   } = params;
 
   if (directives.hasModelDirective) {
+    const modelDirective = directives.rawModelDirective?.trim().toLowerCase();
     const isModelListAlias =
-      directives.rawModelDirective?.trim().toLowerCase() === "status";
+      modelDirective === "status" || modelDirective === "list";
     if (!directives.rawModelDirective || isModelListAlias) {
       if (allowedModelCatalog.length === 0) {
         return { text: "No models available." };
+      }
+      const agentDir = resolveClawdbotAgentDir();
+      const modelsPath = `${agentDir}/models.json`;
+      const authByProvider = new Map<string, string>();
+      for (const entry of allowedModelCatalog) {
+        if (authByProvider.has(entry.provider)) continue;
+        const auth = await resolveAuthLabel(
+          entry.provider,
+          params.cfg,
+          modelsPath,
+        );
+        authByProvider.set(entry.provider, formatAuthLabel(auth));
       }
       const current = `${params.provider}/${params.model}`;
       const defaultLabel = `${defaultProvider}/${defaultModel}`;
@@ -214,11 +344,16 @@ export async function handleDirectiveOnly(params: {
           aliases && aliases.length > 0
             ? ` (alias: ${aliases.join(", ")})`
             : "";
-        const suffix =
+        const nameSuffix =
           entry.name && entry.name !== entry.id ? ` — ${entry.name}` : "";
-        lines.push(`- ${label}${aliasSuffix}${suffix}`);
+        const authLabel = authByProvider.get(entry.provider) ?? "missing";
+        const authSuffix = ` — auth: ${authLabel}`;
+        lines.push(`- ${label}${aliasSuffix}${nameSuffix}${authSuffix}`);
       }
       return { text: lines.join("\n") };
+    }
+    if (directives.rawModelProfile && !modelDirective) {
+      throw new Error("Auth profile override requires a model selection.");
     }
   }
 
@@ -292,6 +427,7 @@ export async function handleDirectiveOnly(params: {
   }
 
   let modelSelection: ModelDirectiveSelection | undefined;
+  let profileOverride: string | undefined;
   if (directives.hasModelDirective && directives.rawModelDirective) {
     const resolved = resolveModelDirectiveSelection({
       raw: directives.rawModelDirective,
@@ -305,6 +441,17 @@ export async function handleDirectiveOnly(params: {
     }
     modelSelection = resolved.selection;
     if (modelSelection) {
+      if (directives.rawModelProfile) {
+        const profileResolved = resolveProfileOverride({
+          rawProfile: directives.rawModelProfile,
+          provider: modelSelection.provider,
+          cfg: params.cfg,
+        });
+        if (profileResolved.error) {
+          return { text: profileResolved.error };
+        }
+        profileOverride = profileResolved.profileId;
+      }
       const nextLabel = `${modelSelection.provider}/${modelSelection.model}`;
       if (nextLabel !== initialModelLabel) {
         enqueueSystemEvent(
@@ -315,6 +462,9 @@ export async function handleDirectiveOnly(params: {
         );
       }
     }
+  }
+  if (directives.rawModelProfile && !modelSelection) {
+    return { text: "Auth profile override requires a model selection." };
   }
 
   if (sessionEntry && sessionStore && sessionKey) {
@@ -337,6 +487,11 @@ export async function handleDirectiveOnly(params: {
       } else {
         sessionEntry.providerOverride = modelSelection.provider;
         sessionEntry.modelOverride = modelSelection.model;
+      }
+      if (profileOverride) {
+        sessionEntry.authProfileOverride = profileOverride;
+      } else if (directives.hasModelDirective) {
+        delete sessionEntry.authProfileOverride;
       }
     }
     if (directives.hasQueueDirective && directives.queueReset) {
@@ -395,6 +550,9 @@ export async function handleDirectiveOnly(params: {
         ? `Model reset to default (${labelWithAlias}).`
         : `Model set to ${labelWithAlias}.`,
     );
+    if (profileOverride) {
+      parts.push(`Auth profile set to ${profileOverride}.`);
+    }
   }
   if (directives.hasQueueDirective && directives.queueMode) {
     parts.push(`${SYSTEM_MARK} Queue mode set to ${directives.queueMode}.`);
@@ -422,6 +580,7 @@ export async function handleDirectiveOnly(params: {
 export async function persistInlineDirectives(params: {
   directives: InlineDirectives;
   effectiveModelDirective?: string;
+  cfg: ClawdbotConfig;
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;
   sessionKey?: string;
@@ -440,6 +599,7 @@ export async function persistInlineDirectives(params: {
 }): Promise<{ provider: string; model: string; contextTokens: number }> {
   const {
     directives,
+    cfg,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -500,6 +660,18 @@ export async function persistInlineDirectives(params: {
       if (resolved) {
         const key = modelKey(resolved.ref.provider, resolved.ref.model);
         if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+          let profileOverride: string | undefined;
+          if (directives.rawModelProfile) {
+            const profileResolved = resolveProfileOverride({
+              rawProfile: directives.rawModelProfile,
+              provider: resolved.ref.provider,
+              cfg,
+            });
+            if (profileResolved.error) {
+              throw new Error(profileResolved.error);
+            }
+            profileOverride = profileResolved.profileId;
+          }
           const isDefault =
             resolved.ref.provider === defaultProvider &&
             resolved.ref.model === defaultModel;
@@ -509,6 +681,11 @@ export async function persistInlineDirectives(params: {
           } else {
             sessionEntry.providerOverride = resolved.ref.provider;
             sessionEntry.modelOverride = resolved.ref.model;
+          }
+          if (profileOverride) {
+            sessionEntry.authProfileOverride = profileOverride;
+          } else if (directives.hasModelDirective) {
+            delete sessionEntry.authProfileOverride;
           }
           provider = resolved.ref.provider;
           model = resolved.ref.model;

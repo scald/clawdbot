@@ -4,9 +4,15 @@ import { Buffer } from "node:buffer";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
 import type { ApiClientOptions, Message } from "grammy";
 import { Bot, InputFile, webhookCallback } from "grammy";
-
 import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
+import { hasControlCommand } from "../auto-reply/command-detection.js";
 import { formatAgentEnvelope } from "../auto-reply/envelope.js";
+import {
+  buildMentionRegexes,
+  matchesMentionPatterns,
+} from "../auto-reply/reply/mentions.js";
+import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
+import type { TypingController } from "../auto-reply/reply/typing.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import type { ReplyToMode } from "../config/config.js";
@@ -16,7 +22,7 @@ import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { getChildLogger } from "../logging.js";
 import { mediaKindFromMime } from "../media/constants.js";
-import { detectMime } from "../media/mime.js";
+import { detectMime, isGifMedia } from "../media/mime.js";
 import { saveMediaBuffer } from "../media/store.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { loadWebMedia } from "../web/media.js";
@@ -66,6 +72,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   const mediaMaxBytes =
     (opts.mediaMaxMb ?? cfg.telegram?.mediaMaxMb ?? 5) * 1024 * 1024;
   const logger = getChildLogger({ module: "telegram-auto-reply" });
+  const mentionRegexes = buildMentionRegexes(cfg);
   const resolveGroupRequireMention = (chatId: string | number) => {
     const groupId = String(chatId);
     const groupConfig = cfg.telegram?.groups?.[groupId];
@@ -114,10 +121,39 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       }
 
       const botUsername = ctx.me?.username?.toLowerCase();
+      const allowFromList = Array.isArray(allowFrom)
+        ? allowFrom.map((entry) => String(entry).trim()).filter(Boolean)
+        : [];
+      const senderId = msg.from?.id ? String(msg.from.id) : "";
+      const senderUsername = msg.from?.username ?? "";
+      const commandAuthorized =
+        allowFromList.length === 0 ||
+        allowFromList.includes("*") ||
+        (senderId && allowFromList.includes(senderId)) ||
+        (senderId && allowFromList.includes(`telegram:${senderId}`)) ||
+        (senderUsername &&
+          allowFromList.some(
+            (entry) =>
+              entry.toLowerCase() === senderUsername.toLowerCase() ||
+              entry.toLowerCase() === `@${senderUsername.toLowerCase()}`,
+          ));
       const wasMentioned =
-        Boolean(botUsername) && hasBotMention(msg, botUsername);
-      if (isGroup && resolveGroupRequireMention(chatId) && botUsername) {
-        if (!wasMentioned) {
+        (Boolean(botUsername) && hasBotMention(msg, botUsername)) ||
+        matchesMentionPatterns(msg.text ?? msg.caption ?? "", mentionRegexes);
+      const hasAnyMention = (msg.entities ?? msg.caption_entities ?? []).some(
+        (ent) => ent.type === "mention",
+      );
+      const shouldBypassMention =
+        isGroup &&
+        resolveGroupRequireMention(chatId) &&
+        !wasMentioned &&
+        !hasAnyMention &&
+        commandAuthorized &&
+        hasControlCommand(msg.text ?? msg.caption ?? "");
+      const canDetectMention =
+        Boolean(botUsername) || mentionRegexes.length > 0;
+      if (isGroup && resolveGroupRequireMention(chatId) && canDetectMention) {
+        if (!wasMentioned && !shouldBypassMention) {
           logger.info(
             { chatId, reason: "no-mention" },
             "skipping group message",
@@ -141,9 +177,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       ).trim();
       if (!rawBody) return;
       const replySuffix = replyTarget
-        ? `\n\n[Replying to ${replyTarget.sender}${
-            replyTarget.id ? ` id:${replyTarget.id}` : ""
-          }]\n${replyTarget.body}\n[/Replying]`
+        ? `\n\n[Replying to ${replyTarget.sender}${replyTarget.id ? ` id:${replyTarget.id}` : ""}]\n${replyTarget.body}\n[/Replying]`
         : "";
       const body = formatAgentEnvelope({
         surface: "Telegram",
@@ -161,16 +195,19 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         ChatType: isGroup ? "group" : "direct",
         GroupSubject: isGroup ? (msg.chat.title ?? undefined) : undefined,
         SenderName: buildSenderName(msg),
+        SenderId: senderId || undefined,
+        SenderUsername: senderUsername || undefined,
         Surface: "telegram",
         MessageSid: String(msg.message_id),
         ReplyToId: replyTarget?.id,
         ReplyToBody: replyTarget?.body,
         ReplyToSender: replyTarget?.sender,
         Timestamp: msg.date ? msg.date * 1000 : undefined,
-        WasMentioned: isGroup && botUsername ? wasMentioned : undefined,
+        WasMentioned: isGroup ? wasMentioned : undefined,
         MediaPath: media?.path,
         MediaType: media?.contentType,
         MediaUrl: media?.path,
+        CommandAuthorized: commandAuthorized,
       };
 
       if (replyTarget && shouldLogVerbose()) {
@@ -199,37 +236,40 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         );
       }
 
-      let blockSendChain: Promise<void> = Promise.resolve();
-      const sendBlockReply = (payload: ReplyPayload) => {
-        if (
-          !payload?.text &&
-          !payload?.mediaUrl &&
-          !(payload?.mediaUrls?.length ?? 0)
-        ) {
-          return;
-        }
-        blockSendChain = blockSendChain
-          .then(async () => {
-            await deliverReplies({
-              replies: [payload],
-              chatId: String(chatId),
-              token: opts.token,
-              runtime,
-              bot,
-              replyToMode,
-              textLimit,
-            });
-          })
-          .catch((err) => {
-            runtime.error?.(
-              danger(`telegram block reply failed: ${String(err)}`),
-            );
+      let typingController: TypingController | undefined;
+      const dispatcher = createReplyDispatcher({
+        responsePrefix: cfg.messages?.responsePrefix,
+        deliver: async (payload) => {
+          await deliverReplies({
+            replies: [payload],
+            chatId: String(chatId),
+            token: opts.token,
+            runtime,
+            bot,
+            replyToMode,
+            textLimit,
           });
-      };
+        },
+        onIdle: () => {
+          typingController?.markDispatchIdle();
+        },
+        onError: (err, info) => {
+          runtime.error?.(
+            danger(`telegram ${info.kind} reply failed: ${String(err)}`),
+          );
+        },
+      });
 
       const replyResult = await getReplyFromConfig(
         ctxPayload,
-        { onReplyStart: sendTyping, onBlockReply: sendBlockReply },
+        {
+          onReplyStart: sendTyping,
+          onTypingController: (typing) => {
+            typingController = typing;
+          },
+          onToolResult: dispatcher.sendToolResult,
+          onBlockReply: dispatcher.sendBlockReply,
+        },
         cfg,
       );
       const replies = replyResult
@@ -237,18 +277,13 @@ export function createTelegramBot(opts: TelegramBotOptions) {
           ? replyResult
           : [replyResult]
         : [];
-      await blockSendChain;
-      if (replies.length === 0) return;
-
-      await deliverReplies({
-        replies,
-        chatId: String(chatId),
-        token: opts.token,
-        runtime,
-        bot,
-        replyToMode,
-        textLimit,
-      });
+      let queuedFinal = false;
+      for (const reply of replies) {
+        queuedFinal = dispatcher.sendFinalReply(reply) || queuedFinal;
+      }
+      await dispatcher.waitForIdle();
+      typingController?.markDispatchIdle();
+      if (!queuedFinal) return;
     } catch (err) {
       runtime.error?.(danger(`handler failed: ${String(err)}`));
     }
@@ -308,14 +343,24 @@ async function deliverReplies(params: {
     for (const mediaUrl of mediaList) {
       const media = await loadWebMedia(mediaUrl);
       const kind = mediaKindFromMime(media.contentType ?? undefined);
-      const file = new InputFile(media.buffer, media.fileName ?? "file");
+      const isGif = isGifMedia({
+        contentType: media.contentType,
+        fileName: media.fileName,
+      });
+      const fileName = media.fileName ?? (isGif ? "animation.gif" : "file");
+      const file = new InputFile(media.buffer, fileName);
       const caption = first ? (reply.text ?? undefined) : undefined;
       first = false;
       const replyToMessageId =
         replyToId && (replyToMode === "all" || !hasReplied)
           ? replyToId
           : undefined;
-      if (kind === "image") {
+      if (isGif) {
+        await bot.api.sendAnimation(chatId, file, {
+          caption,
+          reply_to_message_id: replyToMessageId,
+        });
+      } else if (kind === "image") {
         await bot.api.sendPhoto(chatId, file, {
           caption,
           reply_to_message_id: replyToMessageId,

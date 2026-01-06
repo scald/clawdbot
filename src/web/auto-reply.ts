@@ -5,9 +5,16 @@ import {
   parseActivationCommand,
 } from "../auto-reply/group-activation.js";
 import {
+  DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
   HEARTBEAT_PROMPT,
   stripHeartbeatToken,
 } from "../auto-reply/heartbeat.js";
+import {
+  buildMentionRegexes,
+  normalizeMentionText,
+} from "../auto-reply/reply/mentions.js";
+import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
+import type { TypingController } from "../auto-reply/reply/typing.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import { HEARTBEAT_TOKEN, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
@@ -25,6 +32,7 @@ import {
 import { logVerbose, shouldLogVerbose } from "../globals.js";
 import { emitHeartbeatEvent } from "../infra/heartbeat-events.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
+import { registerUnhandledRejectionHandler } from "../infra/unhandled-rejections.js";
 import { createSubsystemLogger, getChildLogger } from "../logging.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { isSelfChatMode, jidToE164, normalizeE164 } from "../utils.js";
@@ -47,6 +55,45 @@ const whatsappLog = createSubsystemLogger("gateway/providers/whatsapp");
 const whatsappInboundLog = whatsappLog.child("inbound");
 const whatsappOutboundLog = whatsappLog.child("outbound");
 const whatsappHeartbeatLog = whatsappLog.child("heartbeat");
+
+const isLikelyWhatsAppCryptoError = (reason: unknown) => {
+  const formatReason = (value: unknown): string => {
+    if (value == null) return "";
+    if (typeof value === "string") return value;
+    if (value instanceof Error) {
+      return `${value.message}\n${value.stack ?? ""}`;
+    }
+    if (typeof value === "object") {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return Object.prototype.toString.call(value);
+      }
+    }
+    if (typeof value === "number") return String(value);
+    if (typeof value === "boolean") return String(value);
+    if (typeof value === "bigint") return String(value);
+    if (typeof value === "symbol") return value.description ?? value.toString();
+    if (typeof value === "function")
+      return value.name ? `[function ${value.name}]` : "[function]";
+    return Object.prototype.toString.call(value);
+  };
+  const raw =
+    reason instanceof Error
+      ? `${reason.message}\n${reason.stack ?? ""}`
+      : formatReason(reason);
+  const haystack = raw.toLowerCase();
+  const hasAuthError =
+    haystack.includes("unsupported state or unable to authenticate data") ||
+    haystack.includes("bad mac");
+  if (!hasAuthError) return false;
+  return (
+    haystack.includes("@whiskeysockets/baileys") ||
+    haystack.includes("baileys") ||
+    haystack.includes("noise-handler") ||
+    haystack.includes("aesdecryptgcm")
+  );
+};
 
 // Send via the active gateway-backed listener. The monitor already owns the single
 // Baileys session, so use its send API directly.
@@ -105,17 +152,7 @@ type MentionConfig = {
 };
 
 function buildMentionConfig(cfg: ReturnType<typeof loadConfig>): MentionConfig {
-  const gc = cfg.routing?.groupChat;
-  const mentionRegexes =
-    gc?.mentionPatterns
-      ?.map((p) => {
-        try {
-          return new RegExp(p, "i");
-        } catch {
-          return null;
-        }
-      })
-      .filter((r): r is RegExp => Boolean(r)) ?? [];
+  const mentionRegexes = buildMentionRegexes(cfg);
   return { mentionRegexes, allowFrom: cfg.whatsapp?.allowFrom };
 }
 
@@ -124,10 +161,8 @@ function isBotMentioned(
   mentionCfg: MentionConfig,
 ): boolean {
   const clean = (text: string) =>
-    text
-      // Remove zero-width and directionality markers WhatsApp injects around display names
-      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "")
-      .toLowerCase();
+    // Remove zero-width and directionality markers WhatsApp injects around display names
+    normalizeMentionText(text);
 
   const isSelfChat = isSelfChatMode(msg.selfE164, mentionCfg.allowFrom);
 
@@ -170,9 +205,7 @@ function debugMention(
   const details = {
     from: msg.from,
     body: msg.body,
-    bodyClean: msg.body
-      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "")
-      .toLowerCase(),
+    bodyClean: normalizeMentionText(msg.body),
     mentionedJids: msg.mentionedJids ?? null,
     selfJid: msg.selfJid ?? null,
     selfE164: msg.selfE164 ?? null,
@@ -181,14 +214,6 @@ function debugMention(
 }
 
 export { stripHeartbeatToken };
-
-function isSilentReply(payload?: ReplyPayload): boolean {
-  if (!payload) return false;
-  const text = payload.text?.trim();
-  if (!text || text !== SILENT_REPLY_TOKEN) return false;
-  if (payload.mediaUrl || payload.mediaUrls?.length) return false;
-  return true;
-}
 
 function resolveHeartbeatReplyPayload(
   replyResult: ReplyPayload | ReplyPayload[] | undefined,
@@ -336,9 +361,13 @@ export async function runWebHeartbeatOnce(opts: {
     const hasMedia = Boolean(
       replyPayload.mediaUrl || (replyPayload.mediaUrls?.length ?? 0) > 0,
     );
+    const ackMaxChars = Math.max(
+      0,
+      cfg.agent?.heartbeat?.ackMaxChars ?? DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
+    );
     const stripped = stripHeartbeatToken(replyPayload.text, {
       mode: "heartbeat",
-      maxAckChars: 30,
+      maxAckChars: ackMaxChars,
     });
     if (stripped.shouldSkip && !hasMedia) {
       // Don't let heartbeats keep sessions alive: restore previous updatedAt so idle expiry still works.
@@ -912,6 +941,25 @@ export async function monitorWebProvider(
   // Track recently sent messages to prevent echo loops
   const recentlySent = new Set<string>();
   const MAX_RECENT_MESSAGES = 100;
+  const rememberSentText = (
+    text: string | undefined,
+    opts: { combinedBody: string; logVerboseMessage?: boolean },
+  ) => {
+    if (!text) return;
+    recentlySent.add(text);
+    if (opts.combinedBody) {
+      recentlySent.add(opts.combinedBody);
+    }
+    if (opts.logVerboseMessage) {
+      logVerbose(
+        `Added to echo detection set (size now: ${recentlySent.size}): ${text.substring(0, 50)}...`,
+      );
+    }
+    if (recentlySent.size > MAX_RECENT_MESSAGES) {
+      const firstKey = recentlySent.values().next().value;
+      if (firstKey) recentlySent.delete(firstKey);
+    }
+  };
 
   while (true) {
     if (stopRequested()) break;
@@ -923,6 +971,7 @@ export async function monitorWebProvider(
     let lastMessageAt: number | null = null;
     let handledMessages = 0;
     let _lastInboundMsg: WebInboundMsg | null = null;
+    let unregisterUnhandled: (() => void) | null = null;
 
     // Watchdog to detect stuck message processing (e.g., event emitter died)
     // Should be significantly longer than the reply heartbeat interval to avoid false positives
@@ -1062,114 +1111,75 @@ export async function monitorWebProvider(
         }
       }
 
-      const responsePrefix = cfg.messages?.responsePrefix;
       const textLimit = resolveTextChunkLimit(cfg, "whatsapp");
       let didLogHeartbeatStrip = false;
       let didSendReply = false;
-      let toolSendChain: Promise<void> = Promise.resolve();
-      const sendToolResult = (payload: ReplyPayload) => {
-        if (
-          !payload?.text &&
-          !payload?.mediaUrl &&
-          !(payload?.mediaUrls?.length ?? 0)
-        ) {
-          return;
-        }
-        if (isSilentReply(payload)) return;
-        const toolPayload: ReplyPayload = { ...payload };
-        if (toolPayload.text?.includes(HEARTBEAT_TOKEN)) {
-          const stripped = stripHeartbeatToken(toolPayload.text, {
-            mode: "message",
-          });
-          if (stripped.didStrip && !didLogHeartbeatStrip) {
+      let typingController: TypingController | undefined;
+      const dispatcher = createReplyDispatcher({
+        responsePrefix: cfg.messages?.responsePrefix,
+        onHeartbeatStrip: () => {
+          if (!didLogHeartbeatStrip) {
             didLogHeartbeatStrip = true;
             logVerbose("Stripped stray HEARTBEAT_OK token from web reply");
           }
-          const hasMedia = Boolean(
-            toolPayload.mediaUrl || (toolPayload.mediaUrls?.length ?? 0) > 0,
+        },
+        deliver: async (payload, info) => {
+          await deliverWebReply({
+            replyResult: payload,
+            msg,
+            maxMediaBytes,
+            textLimit,
+            replyLogger,
+            connectionId,
+            // Tool + block updates are noisy; skip their log lines.
+            skipLog: info.kind !== "final",
+          });
+          didSendReply = true;
+          if (info.kind === "tool") {
+            rememberSentText(payload.text, { combinedBody: "" });
+            return;
+          }
+          const shouldLog =
+            info.kind === "final" && payload.text ? true : undefined;
+          rememberSentText(payload.text, {
+            combinedBody,
+            logVerboseMessage: shouldLog,
+          });
+          if (info.kind === "final") {
+            const fromDisplay =
+              msg.chatType === "group"
+                ? conversationId
+                : (msg.from ?? "unknown");
+            const hasMedia = Boolean(
+              payload.mediaUrl || payload.mediaUrls?.length,
+            );
+            whatsappOutboundLog.info(
+              `Auto-replied to ${fromDisplay}${hasMedia ? " (media)" : ""}`,
+            );
+            if (shouldLogVerbose()) {
+              const preview =
+                payload.text != null ? elide(payload.text, 400) : "<media>";
+              whatsappOutboundLog.debug(
+                `Reply body: ${preview}${hasMedia ? " (media)" : ""}`,
+              );
+            }
+          }
+        },
+        onIdle: () => {
+          typingController?.markDispatchIdle();
+        },
+        onError: (err, info) => {
+          const label =
+            info.kind === "tool"
+              ? "tool update"
+              : info.kind === "block"
+                ? "block update"
+                : "auto-reply";
+          whatsappOutboundLog.error(
+            `Failed sending web ${label} to ${msg.from ?? conversationId}: ${formatError(err)}`,
           );
-          if (stripped.shouldSkip && !hasMedia) return;
-          toolPayload.text = stripped.text;
-        }
-        if (
-          responsePrefix &&
-          toolPayload.text &&
-          toolPayload.text.trim() !== HEARTBEAT_TOKEN &&
-          !toolPayload.text.startsWith(responsePrefix)
-        ) {
-          toolPayload.text = `${responsePrefix} ${toolPayload.text}`;
-        }
-        toolSendChain = toolSendChain
-          .then(async () => {
-            await deliverWebReply({
-              replyResult: toolPayload,
-              msg,
-              maxMediaBytes,
-              textLimit,
-              replyLogger,
-              connectionId,
-              skipLog: true,
-            });
-            didSendReply = true;
-            if (toolPayload.text) {
-              recentlySent.add(toolPayload.text);
-              if (recentlySent.size > MAX_RECENT_MESSAGES) {
-                const firstKey = recentlySent.values().next().value;
-                if (firstKey) recentlySent.delete(firstKey);
-              }
-            }
-          })
-          .catch((err) => {
-            whatsappOutboundLog.error(
-              `Failed sending web tool update to ${msg.from ?? conversationId}: ${formatError(err)}`,
-            );
-          });
-      };
-      const sendBlockReply = (payload: ReplyPayload) => {
-        if (
-          !payload?.text &&
-          !payload?.mediaUrl &&
-          !(payload?.mediaUrls?.length ?? 0)
-        ) {
-          return;
-        }
-        if (isSilentReply(payload)) return;
-        const blockPayload: ReplyPayload = { ...payload };
-        if (
-          responsePrefix &&
-          blockPayload.text &&
-          blockPayload.text.trim() !== HEARTBEAT_TOKEN &&
-          !blockPayload.text.startsWith(responsePrefix)
-        ) {
-          blockPayload.text = `${responsePrefix} ${blockPayload.text}`;
-        }
-        toolSendChain = toolSendChain
-          .then(async () => {
-            await deliverWebReply({
-              replyResult: blockPayload,
-              msg,
-              maxMediaBytes,
-              textLimit,
-              replyLogger,
-              connectionId,
-              skipLog: true,
-            });
-            didSendReply = true;
-            if (blockPayload.text) {
-              recentlySent.add(blockPayload.text);
-              recentlySent.add(combinedBody);
-              if (recentlySent.size > MAX_RECENT_MESSAGES) {
-                const firstKey = recentlySent.values().next().value;
-                if (firstKey) recentlySent.delete(firstKey);
-              }
-            }
-          })
-          .catch((err) => {
-            whatsappOutboundLog.error(
-              `Failed sending web block update to ${msg.from ?? conversationId}: ${formatError(err)}`,
-            );
-          });
-      };
+        },
+      });
 
       const replyResult = await (replyResolver ?? getReplyFromConfig)(
         {
@@ -1197,8 +1207,15 @@ export async function monitorWebProvider(
         },
         {
           onReplyStart: msg.sendComposing,
-          onToolResult: sendToolResult,
-          onBlockReply: sendBlockReply,
+          onTypingController: (typing) => {
+            typingController = typing;
+          },
+          onToolResult: (payload) => {
+            dispatcher.sendToolResult(payload);
+          },
+          onBlockReply: (payload) => {
+            dispatcher.sendBlockReply(payload);
+          },
         },
       );
 
@@ -1208,12 +1225,13 @@ export async function monitorWebProvider(
           : [replyResult]
         : [];
 
-      const sendableReplies = replyList.filter(
-        (payload) => !isSilentReply(payload),
-      );
-
-      if (sendableReplies.length === 0) {
-        await toolSendChain;
+      let queuedFinal = false;
+      for (const replyPayload of replyList) {
+        queuedFinal = dispatcher.sendFinalReply(replyPayload) || queuedFinal;
+      }
+      await dispatcher.waitForIdle();
+      typingController?.markDispatchIdle();
+      if (!queuedFinal) {
         if (shouldClearGroupHistory && didSendReply) {
           groupHistories.set(conversationId, []);
         }
@@ -1221,79 +1239,6 @@ export async function monitorWebProvider(
           "Skipping auto-reply: silent token or no text/media returned from resolver",
         );
         return;
-      }
-
-      await toolSendChain;
-
-      for (const replyPayload of sendableReplies) {
-        if (replyPayload.text?.includes(HEARTBEAT_TOKEN)) {
-          const stripped = stripHeartbeatToken(replyPayload.text, {
-            mode: "message",
-          });
-          if (stripped.didStrip && !didLogHeartbeatStrip) {
-            didLogHeartbeatStrip = true;
-            logVerbose("Stripped stray HEARTBEAT_OK token from web reply");
-          }
-          const hasMedia = Boolean(
-            replyPayload.mediaUrl || (replyPayload.mediaUrls?.length ?? 0) > 0,
-          );
-          if (stripped.shouldSkip && !hasMedia) continue;
-          replyPayload.text = stripped.text;
-        }
-        if (
-          responsePrefix &&
-          replyPayload.text &&
-          replyPayload.text.trim() !== HEARTBEAT_TOKEN &&
-          !replyPayload.text.startsWith(responsePrefix)
-        ) {
-          replyPayload.text = `${responsePrefix} ${replyPayload.text}`;
-        }
-
-        try {
-          await deliverWebReply({
-            replyResult: replyPayload,
-            msg,
-            maxMediaBytes,
-            textLimit,
-            replyLogger,
-            connectionId,
-          });
-          didSendReply = true;
-
-          if (replyPayload.text) {
-            recentlySent.add(replyPayload.text);
-            recentlySent.add(combinedBody); // Prevent echo on the combined text itself
-            logVerbose(
-              `Added to echo detection set (size now: ${recentlySent.size}): ${replyPayload.text.substring(0, 50)}...`,
-            );
-            if (recentlySent.size > MAX_RECENT_MESSAGES) {
-              const firstKey = recentlySent.values().next().value;
-              if (firstKey) recentlySent.delete(firstKey);
-            }
-          }
-
-          const fromDisplay =
-            msg.chatType === "group" ? conversationId : (msg.from ?? "unknown");
-          const hasMedia = Boolean(
-            replyPayload.mediaUrl || replyPayload.mediaUrls?.length,
-          );
-          whatsappOutboundLog.info(
-            `Auto-replied to ${fromDisplay}${hasMedia ? " (media)" : ""}`,
-          );
-          if (shouldLogVerbose()) {
-            const preview =
-              replyPayload.text != null
-                ? elide(replyPayload.text, 400)
-                : "<media>";
-            whatsappOutboundLog.debug(
-              `Reply body: ${preview}${hasMedia ? " (media)" : ""}`,
-            );
-          }
-        } catch (err) {
-          whatsappOutboundLog.error(
-            `Failed sending web auto-reply to ${msg.from ?? conversationId}: ${formatError(err)}`,
-          );
-        }
       }
 
       if (shouldClearGroupHistory && didSendReply) {
@@ -1400,9 +1345,27 @@ export async function monitorWebProvider(
     );
 
     setActiveWebListener(listener);
+    unregisterUnhandled = registerUnhandledRejectionHandler((reason) => {
+      if (!isLikelyWhatsAppCryptoError(reason)) return false;
+      const errorStr = formatError(reason);
+      reconnectLogger.warn(
+        { connectionId, error: errorStr },
+        "web reconnect: unhandled rejection from WhatsApp socket; forcing reconnect",
+      );
+      listener.signalClose?.({
+        status: 499,
+        isLoggedOut: false,
+        error: reason,
+      });
+      return true;
+    });
 
     const closeListener = async () => {
       setActiveWebListener(null);
+      if (unregisterUnhandled) {
+        unregisterUnhandled();
+        unregisterUnhandled = null;
+      }
       if (heartbeat) clearInterval(heartbeat);
       if (watchdogTimer) clearInterval(watchdogTimer);
       if (backgroundTasks.size > 0) {

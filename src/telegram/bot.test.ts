@@ -2,27 +2,45 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as replyModule from "../auto-reply/reply.js";
 import { createTelegramBot } from "./bot.js";
 
+const { loadWebMedia } = vi.hoisted(() => ({
+  loadWebMedia: vi.fn(),
+}));
+
+vi.mock("../web/media.js", () => ({
+  loadWebMedia,
+}));
+
 const { loadConfig } = vi.hoisted(() => ({
   loadConfig: vi.fn(() => ({})),
 }));
-vi.mock("../config/config.js", () => ({
-  loadConfig,
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig,
+  };
+});
 
 const useSpy = vi.fn();
 const onSpy = vi.fn();
 const stopSpy = vi.fn();
 const sendChatActionSpy = vi.fn();
 const sendMessageSpy = vi.fn(async () => ({ message_id: 77 }));
+const sendAnimationSpy = vi.fn(async () => ({ message_id: 78 }));
+const sendPhotoSpy = vi.fn(async () => ({ message_id: 79 }));
 type ApiStub = {
   config: { use: (arg: unknown) => void };
   sendChatAction: typeof sendChatActionSpy;
   sendMessage: typeof sendMessageSpy;
+  sendAnimation: typeof sendAnimationSpy;
+  sendPhoto: typeof sendPhotoSpy;
 };
 const apiStub: ApiStub = {
   config: { use: useSpy },
   sendChatAction: sendChatActionSpy,
   sendMessage: sendMessageSpy,
+  sendAnimation: sendAnimationSpy,
+  sendPhoto: sendPhotoSpy,
 };
 
 vi.mock("grammy", () => ({
@@ -53,6 +71,9 @@ vi.mock("../auto-reply/reply.js", () => {
 describe("createTelegramBot", () => {
   beforeEach(() => {
     loadConfig.mockReturnValue({});
+    loadWebMedia.mockReset();
+    sendAnimationSpy.mockReset();
+    sendPhotoSpy.mockReset();
   });
 
   it("installs grammY throttler", () => {
@@ -97,7 +118,7 @@ describe("createTelegramBot", () => {
       expect(replySpy).toHaveBeenCalledTimes(1);
       const payload = replySpy.mock.calls[0][0];
       expect(payload.Body).toMatch(
-        /^\[Telegram Ada Lovelace \(@ada_bot\) id:1234 2025-01-09T01:00\+01:00\{Europe\/Vienna\}\]/,
+        /^\[Telegram Ada Lovelace \(@ada_bot\) id:1234 2025-01-09T00:00Z\]/,
       );
       expect(payload.Body).toContain("hello world");
     } finally {
@@ -120,6 +141,107 @@ describe("createTelegramBot", () => {
     });
 
     expect(sendChatActionSpy).toHaveBeenCalledWith(42, "typing");
+  });
+
+  it("accepts group messages when mentionPatterns match (without @botUsername)", async () => {
+    onSpy.mockReset();
+    const replySpy = replyModule.__replySpy as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    replySpy.mockReset();
+
+    loadConfig.mockReturnValue({
+      identity: { name: "Bert" },
+      routing: { groupChat: { mentionPatterns: ["\\bbert\\b"] } },
+      telegram: { groups: { "*": { requireMention: true } } },
+    });
+
+    createTelegramBot({ token: "tok" });
+    const handler = onSpy.mock.calls[0][1] as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await handler({
+      message: {
+        chat: { id: 7, type: "group", title: "Test Group" },
+        text: "bert: introduce yourself",
+        date: 1736380800,
+        message_id: 1,
+        from: { id: 9, first_name: "Ada" },
+      },
+      me: { username: "clawdbot_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const payload = replySpy.mock.calls[0][0];
+    expect(payload.WasMentioned).toBe(true);
+  });
+
+  it("skips group messages when requireMention is enabled and no mention matches", async () => {
+    onSpy.mockReset();
+    const replySpy = replyModule.__replySpy as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    replySpy.mockReset();
+
+    loadConfig.mockReturnValue({
+      routing: { groupChat: { mentionPatterns: ["\\bbert\\b"] } },
+      telegram: { groups: { "*": { requireMention: true } } },
+    });
+
+    createTelegramBot({ token: "tok" });
+    const handler = onSpy.mock.calls[0][1] as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await handler({
+      message: {
+        chat: { id: 7, type: "group", title: "Test Group" },
+        text: "hello everyone",
+        date: 1736380800,
+        message_id: 2,
+        from: { id: 9, first_name: "Ada" },
+      },
+      me: { username: "clawdbot_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(replySpy).not.toHaveBeenCalled();
+  });
+
+  it("allows group messages when requireMention is enabled but mentions cannot be detected", async () => {
+    onSpy.mockReset();
+    const replySpy = replyModule.__replySpy as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    replySpy.mockReset();
+
+    loadConfig.mockReturnValue({
+      routing: { groupChat: { mentionPatterns: [] } },
+      telegram: { groups: { "*": { requireMention: true } } },
+    });
+
+    createTelegramBot({ token: "tok" });
+    const handler = onSpy.mock.calls[0][1] as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await handler({
+      message: {
+        chat: { id: 7, type: "group", title: "Test Group" },
+        text: "hello everyone",
+        date: 1736380800,
+        message_id: 3,
+        from: { id: 9, first_name: "Ada" },
+      },
+      me: {},
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const payload = replySpy.mock.calls[0][0];
+    expect(payload.WasMentioned).toBe(false);
   });
 
   it("includes reply-to context when a Telegram reply is received", async () => {
@@ -222,6 +344,38 @@ describe("createTelegramBot", () => {
     for (const call of rest) {
       expect(call[2]?.reply_to_message_id).toBeUndefined();
     }
+  });
+
+  it("prefixes tool and final replies with responsePrefix", async () => {
+    onSpy.mockReset();
+    sendMessageSpy.mockReset();
+    const replySpy = replyModule.__replySpy as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    replySpy.mockReset();
+    replySpy.mockImplementation(async (_ctx, opts) => {
+      await opts?.onToolResult?.({ text: "tool result" });
+      return { text: "final reply" };
+    });
+    loadConfig.mockReturnValue({ messages: { responsePrefix: "PFX" } });
+
+    createTelegramBot({ token: "tok" });
+    const handler = onSpy.mock.calls[0][1] as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+    await handler({
+      message: {
+        chat: { id: 5, type: "private" },
+        text: "hi",
+        date: 1736380800,
+      },
+      me: { username: "clawdbot_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(sendMessageSpy).toHaveBeenCalledTimes(2);
+    expect(sendMessageSpy.mock.calls[0][1]).toBe("PFX tool result");
+    expect(sendMessageSpy.mock.calls[1][1]).toBe("PFX final reply");
   });
 
   it("honors replyToMode=all for threaded replies", async () => {
@@ -373,5 +527,48 @@ describe("createTelegramBot", () => {
     });
 
     expect(replySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends GIF replies as animations", async () => {
+    onSpy.mockReset();
+    const replySpy = replyModule.__replySpy as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    replySpy.mockReset();
+
+    replySpy.mockResolvedValueOnce({
+      text: "caption",
+      mediaUrl: "https://example.com/fun",
+    });
+
+    loadWebMedia.mockResolvedValueOnce({
+      buffer: Buffer.from("GIF89a"),
+      contentType: "image/gif",
+      fileName: "fun.gif",
+    });
+
+    createTelegramBot({ token: "tok" });
+    const handler = onSpy.mock.calls[0][1] as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await handler({
+      message: {
+        chat: { id: 1234, type: "private" },
+        text: "hello world",
+        date: 1736380800,
+        message_id: 5,
+        from: { first_name: "Ada" },
+      },
+      me: { username: "clawdbot_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(sendAnimationSpy).toHaveBeenCalledTimes(1);
+    expect(sendAnimationSpy).toHaveBeenCalledWith("1234", expect.anything(), {
+      caption: "caption",
+      reply_to_message_id: undefined,
+    });
+    expect(sendPhotoSpy).not.toHaveBeenCalled();
   });
 });

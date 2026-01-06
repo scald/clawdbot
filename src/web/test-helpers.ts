@@ -13,7 +13,6 @@ const DEFAULT_CONFIG = {
   messages: {
     messagePrefix: undefined,
     responsePrefix: undefined,
-    timestampPrefix: false,
   },
 };
 
@@ -31,13 +30,17 @@ export function resetLoadConfigMock() {
   (globalThis as Record<symbol, unknown>)[CONFIG_KEY] = () => DEFAULT_CONFIG;
 }
 
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => {
-    const getter = (globalThis as Record<symbol, unknown>)[CONFIG_KEY];
-    if (typeof getter === "function") return getter();
-    return DEFAULT_CONFIG;
-  },
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => {
+      const getter = (globalThis as Record<symbol, unknown>)[CONFIG_KEY];
+      if (typeof getter === "function") return getter();
+      return DEFAULT_CONFIG;
+    },
+  };
+});
 
 vi.mock("../media/store.js", () => ({
   saveMediaBuffer: vi

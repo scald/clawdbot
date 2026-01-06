@@ -32,6 +32,7 @@ import {
 } from "./antigravity-oauth.js";
 import { healthCommand } from "./health.js";
 import {
+  applyAuthProfileConfig,
   applyMinimaxConfig,
   setAnthropicApiKey,
   writeOAuthCredentials,
@@ -53,6 +54,7 @@ import {
 import { setupProviders } from "./onboard-providers.js";
 import { promptRemoteGatewayConfig } from "./onboard-remote.js";
 import { setupSkills } from "./onboard-skills.js";
+import { ensureSystemdUserLingerInteractive } from "./systemd-linger.js";
 
 type WizardSection =
   | "model"
@@ -274,6 +276,11 @@ async function promptAuthConfig(
       spin.stop("OAuth complete");
       if (oauthCreds) {
         await writeOAuthCredentials("anthropic", oauthCreds);
+        next = applyAuthProfileConfig(next, {
+          profileId: "anthropic:default",
+          provider: "anthropic",
+          mode: "oauth",
+        });
       }
     } catch (err) {
       spin.stop("OAuth failed");
@@ -315,12 +322,33 @@ async function promptAuthConfig(
       spin.stop("Antigravity OAuth complete");
       if (oauthCreds) {
         await writeOAuthCredentials("google-antigravity", oauthCreds);
+        next = applyAuthProfileConfig(next, {
+          profileId: "google-antigravity:default",
+          provider: "google-antigravity",
+          mode: "oauth",
+        });
         // Set default model to Claude Opus 4.5 via Antigravity
         next = {
           ...next,
           agent: {
             ...next.agent,
-            model: "google-antigravity/claude-opus-4-5-thinking",
+            model: {
+              ...(next.agent?.model &&
+              "fallbacks" in (next.agent.model as Record<string, unknown>)
+                ? {
+                    fallbacks: (next.agent.model as { fallbacks?: string[] })
+                      .fallbacks,
+                  }
+                : undefined),
+              primary: "google-antigravity/claude-opus-4-5-thinking",
+            },
+            models: {
+              ...next.agent?.models,
+              "google-antigravity/claude-opus-4-5-thinking":
+                next.agent?.models?.[
+                  "google-antigravity/claude-opus-4-5-thinking"
+                ] ?? {},
+            },
           },
         };
         note(
@@ -341,6 +369,11 @@ async function promptAuthConfig(
       runtime,
     );
     await setAnthropicApiKey(String(key).trim());
+    next = applyAuthProfileConfig(next, {
+      profileId: "anthropic:default",
+      provider: "anthropic",
+      mode: "api_key",
+    });
   } else if (authChoice === "minimax") {
     next = applyMinimaxConfig(next);
   }
@@ -348,7 +381,10 @@ async function promptAuthConfig(
   const modelInput = guardCancel(
     await text({
       message: "Default model (blank to keep)",
-      initialValue: next.agent?.model ?? "",
+      initialValue:
+        typeof next.agent?.model === "string"
+          ? next.agent?.model
+          : (next.agent?.model?.primary ?? ""),
     }),
     runtime,
   );
@@ -358,7 +394,20 @@ async function promptAuthConfig(
       ...next,
       agent: {
         ...next.agent,
-        model,
+        model: {
+          ...(next.agent?.model &&
+          "fallbacks" in (next.agent.model as Record<string, unknown>)
+            ? {
+                fallbacks: (next.agent.model as { fallbacks?: string[] })
+                  .fallbacks,
+              }
+            : undefined),
+          primary: model,
+        },
+        models: {
+          ...next.agent?.models,
+          [model]: next.agent?.models?.[model] ?? {},
+        },
       },
     };
   }
@@ -373,6 +422,8 @@ async function maybeInstallDaemon(params: {
 }) {
   const service = resolveGatewayService();
   const loaded = await service.isLoaded({ env: process.env });
+  let shouldCheckLinger = false;
+  let shouldInstall = true;
   if (loaded) {
     const action = guardCancel(
       await select({
@@ -387,7 +438,8 @@ async function maybeInstallDaemon(params: {
     );
     if (action === "restart") {
       await service.restart({ stdout: process.stdout });
-      return;
+      shouldCheckLinger = true;
+      shouldInstall = false;
     }
     if (action === "skip") return;
     if (action === "reinstall") {
@@ -395,24 +447,41 @@ async function maybeInstallDaemon(params: {
     }
   }
 
-  const devMode =
-    process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
-    process.argv[1]?.endsWith(".ts");
-  const { programArguments, workingDirectory } =
-    await resolveGatewayProgramArguments({ port: params.port, dev: devMode });
-  const environment: Record<string, string | undefined> = {
-    PATH: process.env.PATH,
-    CLAWDBOT_GATEWAY_TOKEN: params.gatewayToken,
-    CLAWDBOT_LAUNCHD_LABEL:
-      process.platform === "darwin" ? GATEWAY_LAUNCH_AGENT_LABEL : undefined,
-  };
-  await service.install({
-    env: process.env,
-    stdout: process.stdout,
-    programArguments,
-    workingDirectory,
-    environment,
-  });
+  if (shouldInstall) {
+    const devMode =
+      process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
+      process.argv[1]?.endsWith(".ts");
+    const { programArguments, workingDirectory } =
+      await resolveGatewayProgramArguments({ port: params.port, dev: devMode });
+    const environment: Record<string, string | undefined> = {
+      PATH: process.env.PATH,
+      CLAWDBOT_GATEWAY_TOKEN: params.gatewayToken,
+      CLAWDBOT_LAUNCHD_LABEL:
+        process.platform === "darwin" ? GATEWAY_LAUNCH_AGENT_LABEL : undefined,
+    };
+    await service.install({
+      env: process.env,
+      stdout: process.stdout,
+      programArguments,
+      workingDirectory,
+      environment,
+    });
+    shouldCheckLinger = true;
+  }
+
+  if (shouldCheckLinger) {
+    await ensureSystemdUserLingerInteractive({
+      runtime: params.runtime,
+      prompter: {
+        confirm: async (p) =>
+          guardCancel(await confirm(p), params.runtime) === true,
+        note,
+      },
+      reason:
+        "Linux installs use a systemd user service. Without lingering, systemd stops the user session on logout/idle and kills the Gateway.",
+      requireConfirm: true,
+    });
+  }
 }
 
 export async function runConfigureWizard(

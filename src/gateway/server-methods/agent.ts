@@ -240,11 +240,12 @@ export const agentHandlers: GatewayRequestHandlers = {
       defaultRuntime,
       context.deps,
     )
-      .then(() => {
+      .then((result) => {
         const payload = {
           runId,
           status: "ok" as const,
           summary: "completed",
+          result,
         };
         context.dedupe.set(`agent:${idem}`, {
           ts: Date.now(),
@@ -288,10 +289,6 @@ export const agentHandlers: GatewayRequestHandlers = {
     }
     const p = params as AgentWaitParams;
     const runId = p.runId.trim();
-    const afterMs =
-      typeof p.afterMs === "number" && Number.isFinite(p.afterMs)
-        ? Math.max(0, Math.floor(p.afterMs))
-        : undefined;
     const timeoutMs =
       typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs)
         ? Math.max(0, Math.floor(p.timeoutMs))
@@ -299,7 +296,6 @@ export const agentHandlers: GatewayRequestHandlers = {
 
     const snapshot = await waitForAgentJob({
       runId,
-      afterMs,
       timeoutMs,
     });
     if (!snapshot) {
@@ -311,7 +307,7 @@ export const agentHandlers: GatewayRequestHandlers = {
     }
     respond(true, {
       runId,
-      status: snapshot.state === "done" ? "ok" : "error",
+      status: snapshot.status,
       startedAt: snapshot.startedAt,
       endedAt: snapshot.endedAt,
       error: snapshot.error,

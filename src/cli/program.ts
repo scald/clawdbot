@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { Command } from "commander";
-import { agentCommand } from "../commands/agent.js";
+import { agentCliCommand } from "../commands/agent-via-gateway.js";
 import { configureCommand } from "../commands/configure.js";
 import { doctorCommand } from "../commands/doctor.js";
 import { healthCommand } from "../commands/health.js";
@@ -10,7 +10,12 @@ import { sessionsCommand } from "../commands/sessions.js";
 import { setupCommand } from "../commands/setup.js";
 import { statusCommand } from "../commands/status.js";
 import { updateCommand } from "../commands/update.js";
-import { readConfigFileSnapshot } from "../config/config.js";
+import {
+  isNixMode,
+  migrateLegacyConfig,
+  readConfigFileSnapshot,
+  writeConfigFile,
+} from "../config/config.js";
 import { danger, setVerbose } from "../globals.js";
 import { loginWeb, logoutWeb } from "../provider-web.js";
 import { defaultRuntime } from "../runtime.js";
@@ -35,7 +40,18 @@ export function buildProgram() {
   const TAGLINE =
     "Send, receive, and auto-reply on WhatsApp (web) and Telegram (bot).";
 
-  program.name("clawdbot").description("").version(PROGRAM_VERSION);
+  program
+    .name("clawdbot")
+    .description("")
+    .version(PROGRAM_VERSION)
+    .option(
+      "--dev",
+      "Dev profile: isolate state under ~/.clawdbot-dev, default gateway port 19001, and shift derived ports (bridge/browser/canvas)",
+    )
+    .option(
+      "--profile <name>",
+      "Use a named profile (isolates CLAWDBOT_STATE_DIR/CLAWDBOT_CONFIG_PATH under ~/.clawdbot-<name>)",
+    );
 
   const formatIntroLine = (version: string, rich = true) => {
     const base = `📡 clawdbot ${version} — ${TAGLINE}`;
@@ -76,6 +92,26 @@ export function buildProgram() {
     if (actionCommand.name() === "doctor") return;
     const snapshot = await readConfigFileSnapshot();
     if (snapshot.legacyIssues.length === 0) return;
+    if (isNixMode) {
+      defaultRuntime.error(
+        danger(
+          "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and retry.",
+        ),
+      );
+      process.exit(1);
+    }
+    const migrated = migrateLegacyConfig(snapshot.parsed);
+    if (migrated.config) {
+      await writeConfigFile(migrated.config);
+      if (migrated.changes.length > 0) {
+        defaultRuntime.log(
+          `Migrated legacy config entries:\n${migrated.changes
+            .map((entry) => `- ${entry}`)
+            .join("\n")}`,
+        );
+      }
+      return;
+    }
     const issues = snapshot.legacyIssues
       .map((issue) => `- ${issue.path}: ${issue.message}`)
       .join("\n");
@@ -96,6 +132,10 @@ export function buildProgram() {
       "Send via your web session and print JSON result.",
     ],
     ["clawdbot gateway --port 18789", "Run the WebSocket Gateway locally."],
+    [
+      "clawdbot --dev gateway",
+      "Run a dev Gateway (isolated state/config) on ws://127.0.0.1:19001.",
+    ],
     [
       "clawdbot gateway --force",
       "Kill anything bound to the default gateway port, then start it.",
@@ -347,9 +387,7 @@ Examples:
 
   program
     .command("agent")
-    .description(
-      "Talk directly to the configured agent (no chat send; optional delivery)",
-    )
+    .description("Run an agent turn via the Gateway (use --local for embedded)")
     .requiredOption("-m, --message <text>", "Message body for the agent")
     .option(
       "-t, --to <number>",
@@ -364,6 +402,11 @@ Examples:
     .option(
       "--provider <provider>",
       "Delivery provider: whatsapp|telegram|discord|slack|signal|imessage (default: whatsapp)",
+    )
+    .option(
+      "--local",
+      "Run the embedded agent locally (requires provider API keys in your shell)",
+      false,
     )
     .option(
       "--deliver",
@@ -390,9 +433,9 @@ Examples:
         typeof opts.verbose === "string" ? opts.verbose.toLowerCase() : "";
       setVerbose(verboseLevel === "on");
       // Build default deps (keeps parity with other commands; future-proofing).
-      void createDefaultDeps();
+      const deps = createDefaultDeps();
       try {
-        await agentCommand(opts, defaultRuntime);
+        await agentCliCommand(opts, defaultRuntime, deps);
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
